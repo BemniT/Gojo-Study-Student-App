@@ -70,7 +70,13 @@ export default function DashboardLayout() {
 
   const HeaderRight = () => (
     <View style={styles.headerRightRow}>
-      <TouchableOpacity style={styles.iconButton} onPress={() => router.push("/chat")}>
+      <TouchableOpacity
+        style={styles.iconButton}
+        onPress={() => {
+          // open app-level chats screen (app/chats.jsx)
+          router.push("/chats");
+        }}
+      >
         <Ionicons name="chatbubble-outline" size={22} color="#222" />
         {totalUnread > 0 && (
           <View style={styles.unreadBadge}>
@@ -79,7 +85,7 @@ export default function DashboardLayout() {
         )}
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={() => router.push("/profile")} style={{ marginLeft: 12 }}>
+      <TouchableOpacity onPress={() => router.push("/dashboard/profile")} style={{ marginLeft: 12 }}>
         <Image
           source={
             profileImage
