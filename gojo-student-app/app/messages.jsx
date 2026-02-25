@@ -9,9 +9,9 @@ import {
   Image,
   StatusBar,
   TextInput,
-  KeyboardAvoidingView,
   Platform,
   Alert,
+  Keyboard,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
@@ -24,11 +24,11 @@ import { useSafeAreaInsets, SafeAreaView } from "react-native-safe-area-context"
 /**
  * app/messages.jsx
  *
- * - Uses deterministic chat IDs: "<userA>_<userB>" (finds either order)
- * - If chat doesn't exist, it creates it at the deterministic key
- * - Optimistic append so sent messages appear immediately
- * - Date separators, bubble tails, per-message seen ticks
- * - Respects safe areas (status + system bars)
+ * - Keeps keyboard listeners / input lifting behavior (working)
+ * - Restores the outgoing ("me") bubble layout to the previous simpler layout
+ *   (small fixed spacer on the right instead of the symmetric flex layout)
+ * - Keeps message normalization, deterministic chat id, optimistic append/resync,
+ *   date separators, bubble tails, seen ticks, and safe area handling.
  */
 
 const PRIMARY = "#007AFB";
@@ -51,7 +51,6 @@ function fmtTime(ts) {
     return "";
   }
 }
-
 function stripTime(d) {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
 }
@@ -81,6 +80,7 @@ export default function MessagesScreen(props) {
   clearOpenedChat();
 
   const [currentUserId, setCurrentUserId] = useState(null);
+  const [currentUserNodeKey, setCurrentUserNodeKey] = useState(null);
   const [chatId, setChatId] = useState(chatFromStore.chatId || "");
   const [contactUserId, setContactUserId] = useState(chatFromStore.contactUserId || "");
   const [contactKey, setContactKey] = useState(chatFromStore.contactKey || "");
@@ -93,28 +93,68 @@ export default function MessagesScreen(props) {
   const [text, setText] = useState("");
   const [lastMessageMeta, setLastMessageMeta] = useState(null);
 
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+
   const messagesRefRef = useRef(null);
   const lastMessageRefRef = useRef(null);
   const flatListRef = useRef(null);
 
   const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
-  // try to find existing deterministic chat id (no create)
-  const findExistingChatId = async (a, b) => {
-    if (!a || !b) return "";
-    const c1 = makeDeterministicChatId(a, b);
-    const c2 = makeDeterministicChatId(b, a);
-    try {
-      const s1 = await get(ref(database, `Chats/${c1}`));
-      if (s1.exists()) return c1;
-      const s2 = await get(ref(database, `Chats/${c2}`));
-      if (s2.exists()) return c2;
-      return "";
-    } catch (e) {
-      console.warn("[Messages] findExistingChatId error", e);
-      return "";
-    }
-  };
+  // Resolve local ids
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      let uId = await AsyncStorage.getItem("userId");
+      const nodeKey = (await AsyncStorage.getItem("userNodeKey")) || (await AsyncStorage.getItem("studentNodeKey")) || (await AsyncStorage.getItem("studentId")) || null;
+
+      if (!uId && nodeKey) {
+        try {
+          const snap = await get(ref(database, `Users/${nodeKey}`));
+          if (snap.exists()) {
+            const v = snap.val();
+            uId = v?.userId || nodeKey;
+          } else {
+            uId = nodeKey;
+          }
+        } catch {
+          uId = nodeKey;
+        }
+      }
+
+      if (mounted) {
+        setCurrentUserId(uId || null);
+        setCurrentUserNodeKey(nodeKey || null);
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
+
+  // Resolve contactUserId if missing
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      if (contactUserId) return;
+      if (!contactKey) return;
+      try {
+        const snap = await get(ref(database, `Users/${contactKey}`));
+        if (snap.exists()) {
+          const v = snap.val();
+          if (v && v.userId) {
+            if (mounted) {
+              setContactUserId(v.userId);
+              setContactName((prev) => prev || v.name || v.username || "");
+              setContactImage((prev) => prev || v.profileImage || null);
+            }
+            return;
+          }
+        }
+      } catch (e) { /* ignore */ }
+      if (mounted) setContactUserId(contactKey);
+    })();
+    return () => { mounted = false; };
+  }, [contactKey, contactUserId]);
 
   // find or create deterministic chat id
   const findOrCreateChatId = async (userA, userB, createIfMissing = true) => {
@@ -127,17 +167,15 @@ export default function MessagesScreen(props) {
       const s2 = await get(ref(database, `Chats/${c2}`));
       if (s2.exists()) return c2;
       if (!createIfMissing) return null;
-
+      // create minimal chat node at c1
       const now = Date.now();
       const participants = { [userA]: true, [userB]: true };
       const lastMessage = { seen: false, senderId: userA, text: "", timeStamp: now, type: "system" };
       const unread = { [userA]: 0, [userB]: 0 };
-
       const baseUpdates = {};
       baseUpdates[`Chats/${c1}/participants`] = participants;
       baseUpdates[`Chats/${c1}/lastMessage`] = lastMessage;
       baseUpdates[`Chats/${c1}/unread`] = unread;
-
       await update(ref(database), baseUpdates);
       return c1;
     } catch (err) {
@@ -146,97 +184,48 @@ export default function MessagesScreen(props) {
     }
   };
 
-  // Resolve current user id
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      let uId = await AsyncStorage.getItem("userId");
-      if (!uId) {
-        const nodeKey = await AsyncStorage.getItem("userNodeKey")
-          || await AsyncStorage.getItem("studentNodeKey")
-          || await AsyncStorage.getItem("studentId")
-          || null;
-        if (nodeKey) {
-          try {
-            const snap = await get(ref(database, `Users/${nodeKey}`));
-            if (snap.exists()) {
-              const v = snap.val();
-              uId = v?.userId || nodeKey;
-            } else {
-              uId = nodeKey;
-            }
-          } catch {
-            uId = nodeKey;
-          }
-        }
-      }
-      if (mounted) setCurrentUserId(uId || null);
-    })();
-    return () => { mounted = false; };
-  }, []);
-
-  // Resolve contactUserId if missing & attempt to set chatId if not provided by store
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (!contactUserId && contactKey) {
-        try {
-          const snap = await get(ref(database, `Users/${contactKey}`));
-          if (snap.exists()) {
-            const v = snap.val();
-            if (v && v.userId && mounted) {
-              setContactUserId(v.userId);
-              setContactName((prev) => prev || v.name || v.username || "");
-              setContactImage((prev) => prev || v.profileImage || null);
-            }
-          }
-        } catch (e) { /* ignore */ }
-      }
-
-      // If chatId wasn't provided via store, try to find existing chat deterministically
-      if (!chatId && contactUserId && currentUserId) {
-        const existing = await findExistingChatId(currentUserId, contactUserId);
-        if (existing && mounted) setChatId(existing);
-      }
-    })();
-    return () => { mounted = false; };
-  }, [contactKey, contactUserId, currentUserId, chatId]);
-
-  // Subscribe to messages for this chatId
+  // Attach listener and normalize messages
   useEffect(() => {
     let mounted = true;
     const attach = async () => {
       if (!chatId) {
         setMessages([]);
         setLoading(false);
-        console.log("[Messages] no chatId yet");
         return;
       }
       setLoading(true);
       const msgsRef = ref(database, `Chats/${chatId}/messages`);
       messagesRefRef.current = msgsRef;
+
       const listener = onValue(msgsRef, (snap) => {
         if (!mounted) return;
         const arr = [];
         if (snap.exists()) {
-          snap.forEach((child) => arr.push(child.val()));
+          snap.forEach((child) => {
+            const data = child.val() || {};
+            const m = { ...data, messageId: data.messageId || child.key };
+            arr.push(m);
+          });
         }
         arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
         setMessages(arr);
         setLoading(false);
-        console.log("[Messages:onValue]", { chatId, currentUserId, count: arr.length, senders: arr.map(m => m.senderId) });
+
+        console.log("[Messages:onValue]", { chatId, currentUserId, currentUserNodeKey, count: arr.length, messages: arr.map(m => ({ id: m.messageId, sender: m.senderId })) });
 
         if (currentUserId) {
           try {
             update(ref(database, `Chats/${chatId}/unread`), { [currentUserId]: 0 }).catch(() => {});
             const updates = {};
             arr.forEach((m) => {
-              if (m.receiverId === currentUserId && !m.seen) {
+              if ((String(m.receiverId) === String(currentUserId) || String(m.receiverId) === String(currentUserNodeKey)) && !m.seen) {
                 updates[`Chats/${chatId}/messages/${m.messageId}/seen`] = true;
               }
             });
             if (Object.keys(updates).length) update(ref(database), updates).catch(() => {});
-          } catch (err) {}
+          } catch (err) {
+            console.warn("[Messages] mark seen error", err);
+          }
         }
       });
       messagesRefRef.current._listener = listener;
@@ -250,9 +239,9 @@ export default function MessagesScreen(props) {
         try { off(messagesRefRef.current); } catch (e) {}
       }
     };
-  }, [chatId, currentUserId]);
+  }, [chatId, currentUserId, currentUserNodeKey]);
 
-  // Subscribe to lastMessage meta for seen ticks
+  // lastMessage meta listener
   useEffect(() => {
     if (!chatId) {
       setLastMessageMeta(null);
@@ -270,34 +259,50 @@ export default function MessagesScreen(props) {
     };
   }, [chatId]);
 
-  // Auto-scroll
+  // auto-scroll
   useEffect(() => {
     setTimeout(() => {
       try { flatListRef.current && flatListRef.current.scrollToEnd({ animated: true }); } catch (e) {}
     }, 120);
   }, [messages]);
 
-  // Helper to resolve user id
+  // keyboard listeners: track height so input sits just above keyboard and returns when keyboard hides
+  useEffect(() => {
+    const onShow = (e) => {
+      setKeyboardVisible(true);
+      const h = (e && e.endCoordinates && e.endCoordinates.height) ? e.endCoordinates.height : 300;
+      setKeyboardHeight(h);
+    };
+    const onHide = () => {
+      setKeyboardVisible(false);
+      setKeyboardHeight(0);
+    };
+
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+
+    const subShow = Keyboard.addListener(showEvent, onShow);
+    const subHide = Keyboard.addListener(hideEvent, onHide);
+
+    return () => {
+      subShow.remove();
+      subHide.remove();
+    };
+  }, []);
+
   const getResolvedUserId = async () => {
     if (currentUserId) return currentUserId;
     let uId = await AsyncStorage.getItem("userId");
     if (uId) return uId;
-    const nodeKey = await AsyncStorage.getItem("userNodeKey")
-      || await AsyncStorage.getItem("studentNodeKey")
-      || await AsyncStorage.getItem("studentId")
-      || null;
+    const nodeKey = await AsyncStorage.getItem("userNodeKey") || await AsyncStorage.getItem("studentNodeKey") || await AsyncStorage.getItem("studentId") || null;
     if (!nodeKey) return null;
     try {
       const snap = await get(ref(database, `Users/${nodeKey}`));
-      if (snap.exists()) {
-        const v = snap.val();
-        return v?.userId || nodeKey;
-      }
+      if (snap.exists()) return snap.val()?.userId || nodeKey;
     } catch {}
     return nodeKey;
   };
 
-  // Create chat at deterministic id and append message
   const createChatAndSend = async (messagePayload) => {
     const cu = await getResolvedUserId();
     if (!cu || !contactUserId) {
@@ -333,7 +338,6 @@ export default function MessagesScreen(props) {
       type: messageObj.type,
     };
 
-    // Build unread updates best-effort
     const updates = {
       [`Chats/${chatKey}/messages/${messageId}`]: messageObj,
       [`Chats/${chatKey}/lastMessage`]: lastMessage,
@@ -348,11 +352,14 @@ export default function MessagesScreen(props) {
           const snap = await get(ref(database, `Chats/${chatKey}/messages`));
           if (snap.exists()) {
             const arr = [];
-            snap.forEach((c) => arr.push(c.val()));
+            snap.forEach((c) => {
+              const data = c.val() || {};
+              arr.push({ ...data, messageId: data.messageId || c.key });
+            });
             arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
             setMessages(arr);
           }
-        } catch {}
+        } catch (e) {}
       }, 900);
     } catch (err) {
       console.warn("[Messages:createChatAndSend] error", err);
@@ -360,7 +367,6 @@ export default function MessagesScreen(props) {
     }
   };
 
-  // Send message using deterministic chat id
   const sendMessage = async () => {
     if (!text.trim()) return;
     setSending(true);
@@ -399,7 +405,6 @@ export default function MessagesScreen(props) {
         deleted: false,
       };
 
-      // compute unread updates best-effort
       const chatRef = ref(database, `Chats/${chatKey}`);
       const chatSnap = await get(chatRef);
       let unreadObj = {};
@@ -437,14 +442,17 @@ export default function MessagesScreen(props) {
       console.log("[Messages:send] writing message", { chatKey, messageId, receiverId: contactUserId, senderId: cu });
       await update(ref(database), updates);
 
-      // optimistic append + resync
       setMessages((prev) => (prev.some((m) => m.messageId === messageId) ? prev : [...prev, messageObj]));
+
       setTimeout(async () => {
         try {
           const snap = await get(ref(database, `Chats/${chatKey}/messages`));
           if (snap.exists()) {
             const arr = [];
-            snap.forEach((c) => arr.push(c.val()));
+            snap.forEach((c) => {
+              const data = c.val() || {};
+              arr.push({ ...data, messageId: data.messageId || c.key });
+            });
             arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
             setMessages(arr);
           }
@@ -462,7 +470,6 @@ export default function MessagesScreen(props) {
     }
   };
 
-  // Build display items with date separators
   const displayItems = useMemo(() => {
     const items = [];
     let lastDateLabel = null;
@@ -485,10 +492,14 @@ export default function MessagesScreen(props) {
     </View>
   );
 
+  // Reverted outgoing bubble layout to previous simple version (small fixed right spacer)
   const renderMessage = ({ item, index }) => {
     if (item.type === "date") return <View style={{ paddingVertical: 10 }}>{renderDateSeparator(item.label)}</View>;
     const m = item;
-    const isMe = String(m.senderId) === String(currentUserId);
+    const isMe =
+      (currentUserId && String(m.senderId) === String(currentUserId)) ||
+      (currentUserNodeKey && String(m.senderId) === String(currentUserNodeKey));
+
     const prev = index > 0 ? displayItems[index - 1] : null;
     const prevSameSender = prev && prev.type === "message" && String(prev.senderId) === String(m.senderId);
     const showAvatar = !isMe && !prevSameSender;
@@ -565,40 +576,38 @@ export default function MessagesScreen(props) {
               renderItem={renderMessage}
               keyExtractor={(it, idx) => (it.type === "date" ? it.id : it.messageId || `${it.timeStamp}-${idx}`)}
               showsVerticalScrollIndicator={false}
-              contentContainerStyle={{ paddingVertical: 12, paddingBottom: 24 }}
+              contentContainerStyle={{ paddingVertical: 12, paddingBottom: 12 + (keyboardVisible ? keyboardHeight : 0) }}
               onContentSizeChange={() => flatListRef.current && flatListRef.current.scrollToEnd({ animated: true })}
             />
           )}
         </View>
 
         {/* Input */}
-        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"}>
-          <View style={[styles.inputRow, { paddingBottom: Math.max(insets.bottom, 8) }]}>
-            <TextInput
-              placeholder="Message"
-              placeholderTextColor="#9AA4C0"
-              value={text}
-              onChangeText={setText}
-              style={styles.input}
-              multiline
-              returnKeyType="send"
-              onSubmitEditing={() => sendMessage()}
-            />
-            <TouchableOpacity
-              style={[styles.sendBtn, (text.trim() ? styles.sendBtnActive : styles.sendBtnDisabled)]}
-              onPress={sendMessage}
-              disabled={!text.trim() || sending}
-            >
-              <Ionicons name="send" size={20} color={text.trim() ? "#fff" : "#BFCBEF"} />
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
+        <View style={[styles.inputRow, { paddingBottom: Math.max(insets.bottom, 8), marginBottom: keyboardVisible ? keyboardHeight : 0 }]}>
+          <TextInput
+            placeholder="Message"
+            placeholderTextColor="#9AA4C0"
+            value={text}
+            onChangeText={setText}
+            style={styles.input}
+            multiline
+            returnKeyType="send"
+            onSubmitEditing={() => sendMessage()}
+          />
+          <TouchableOpacity
+            style={[styles.sendBtn, (text.trim() ? styles.sendBtnActive : styles.sendBtnDisabled)]}
+            onPress={sendMessage}
+            disabled={!text.trim() || sending}
+          >
+            <Ionicons name="send" size={20} color={text.trim() ? "#fff" : "#BFCBEF"} />
+          </TouchableOpacity>
+        </View>
       </View>
     </SafeAreaView>
   );
 }
 
-/* Styles (same as earlier) */
+/* Styles */
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: BG },
   container: { flex: 1, backgroundColor: BG },
