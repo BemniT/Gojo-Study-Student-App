@@ -1,3 +1,4 @@
+// app/chats.jsx
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import {
   View,
@@ -10,27 +11,24 @@ import {
   StatusBar,
   Alert,
   ScrollView,
+  RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, update } from "firebase/database";
+import { ref, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { setOpenedChat } from "./lib/chatStore";
+import { useFocusEffect } from "@react-navigation/native";
 
 /**
  * app/chats.jsx
  *
- * Improvements in this patch:
- * 1) Teacher resolution (TeacherAssignments -> Teachers -> Users) is done once per load and cached in-memory
- *    to avoid repeated DB reads when rendering the list.
- * 2) Adds explicit "no assigned teachers" empty state when the student has no teachers assigned.
- * 3) Keeps deterministic chat id lookup when opening chats and correct unread-badge behavior.
- *
- * Notes:
- * - Chats use deterministic IDs "<userA>_<userB>" (finds either order)
- * - This file expects Users nodes to have .userId property (your DB).
+ * - Merge server results with local cache ("chatsCache") and keep whichever lastTime is newer.
+ * - Preserve lastSenderId and lastSeen fields in the cache so seen state can be shown immediately.
+ * - Time format for last message now uses 12-hour format "8:20 AM".
+ * - Show seen tick on chats list when last message sender is current user and lastMessage.seen === true.
  */
 
 const PRIMARY = "#007AFB";
@@ -38,23 +36,25 @@ const MUTED = "#6B78A8";
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
 const FILTERS = ["All", "Management", "Teachers", "Parents"];
+const debounceWindowMs = 15 * 1000;
 
 function shortText(s, n = 60) {
   if (!s && s !== 0) return "";
   const t = String(s);
   return t.length > n ? t.slice(0, n - 1) + "…" : t;
 }
-
-function fmtTime(ts) {
+function fmtTime12(ts) {
   if (!ts) return "";
   try {
     const d = new Date(Number(ts));
-    const now = new Date();
-    const diff = (now - d) / 1000;
-    if (diff < 60) return `${Math.floor(diff)}s`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
-    return d.toLocaleDateString();
+    let h = d.getHours();
+    const m = d.getMinutes().toString().padStart(2, "0");
+    const ampm = h >= 12 ? "AM" : "AM"; // placeholder
+    // fix above: compute am/pm properly
+    const ampmProper = d.getHours() >= 12 ? "PM" : "AM";
+    h = d.getHours() % 12;
+    if (h === 0) h = 12;
+    return `${h}:${m} ${ampmProper}`;
   } catch {
     return "";
   }
@@ -63,18 +63,19 @@ function fmtTime(ts) {
 export default function ChatsScreen() {
   const router = useRouter();
 
-  const [loading, setLoading] = useState(true);
+  const [loadingInitial, setLoadingInitial] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState("All");
   const [contacts, setContacts] = useState([]);
   const [currentUserNodeKey, setCurrentUserNodeKey] = useState(null);
   const [currentUserId, setCurrentUserId] = useState(null);
 
-  // cacheRef keeps teacher resolution cached for the current student key.
   const cacheRef = useRef({
     studentNodeKey: null,
-    teacherIdsForStudent: null, // Set of teacherIds assigned to the student
-    teacherNodeKeys: null, // Map teacherId -> Users.nodeKey (user node key)
+    teacherIdsForStudent: null,
+    teacherNodeKeys: null,
   });
+  const lastFetchedAtRef = useRef(0);
 
   const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
@@ -93,269 +94,349 @@ export default function ChatsScreen() {
         const v = snap.val();
         return v?.userId || nodeKey;
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
     return nodeKey;
   }, []);
 
-  // Primary load: gather assigned teachers (cached), admins, build contacts list
-  const loadData = useCallback(async () => {
-    setLoading(true);
+  const loadCacheAndShow = async () => {
     try {
-      const nodeKey =
-        (await AsyncStorage.getItem("userNodeKey")) ||
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        null;
-      setCurrentUserNodeKey(nodeKey);
+      const raw = await AsyncStorage.getItem("chatsCache");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setContacts(parsed);
+          setLoadingInitial(false);
+          const fetchedAt = Number(await AsyncStorage.getItem("chatsCacheFetchedAt") || 0);
+          lastFetchedAtRef.current = fetchedAt;
+          return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  };
 
-      const resolvedUserId = await resolveCurrentUserId();
-      setCurrentUserId(resolvedUserId || null);
-
-      // Resolve student grade/section
-      let studentGrade = null;
-      let studentSection = null;
-      let studentNodeKey = null;
+  // Core loader with merge: server results + cache (keep newest lastTime)
+  const loadData = useCallback(
+    async ({ background = false } = {}) => {
+      if (!background) setLoadingInitial(true);
       try {
-        studentNodeKey =
+        const nodeKey =
+          (await AsyncStorage.getItem("userNodeKey")) ||
           (await AsyncStorage.getItem("studentNodeKey")) ||
           (await AsyncStorage.getItem("studentId")) ||
           null;
-        if (studentNodeKey) {
-          const snap = await get(ref(database, `Students/${studentNodeKey}`));
-          if (snap.exists()) {
-            const s = snap.val();
-            studentGrade = s.grade ? String(s.grade) : null;
-            studentSection = s.section ? String(s.section) : null;
-          }
-        }
-      } catch (e) {
-        console.warn("students fetch failed", e);
-      }
+        setCurrentUserNodeKey(nodeKey);
 
-      // Only refresh teacher assignments resolution if student changed
-      if (cacheRef.current.studentNodeKey !== studentNodeKey || !cacheRef.current.teacherIdsForStudent) {
-        // 1) load Courses and build matching course keys for student's grade/section
-        const courseKeys = new Set();
+        const resolvedUserId = await resolveCurrentUserId();
+        setCurrentUserId(resolvedUserId || null);
+
+        // Resolve student's grade/section
+        let studentGrade = null;
+        let studentSection = null;
+        let studentNodeKey = null;
         try {
-          const coursesSnap = await get(ref(database, "Courses"));
-          if (coursesSnap.exists() && studentGrade && studentSection) {
-            coursesSnap.forEach((c) => {
-              const val = c.val();
-              const key = c.key;
-              if (String(val.grade ?? "") === String(studentGrade) && String(val.section ?? "") === String(studentSection)) {
-                courseKeys.add(key);
-              }
-            });
+          studentNodeKey =
+            (await AsyncStorage.getItem("studentNodeKey")) ||
+            (await AsyncStorage.getItem("studentId")) ||
+            null;
+          if (studentNodeKey) {
+            const snap = await get(ref(database, `Students/${studentNodeKey}`));
+            if (snap.exists()) {
+              const s = snap.val();
+              studentGrade = s.grade ? String(s.grade) : null;
+              studentSection = s.section ? String(s.section) : null;
+            }
           }
         } catch (e) {
-          console.warn("Courses fetch failed", e);
+          console.warn("students fetch failed", e);
         }
 
-        // 2) load TeacherAssignments (single read) and collect teacherIds for those courses
-        const teacherIdsForStudent = new Set();
-        try {
-          const taSnap = await get(ref(database, "TeacherAssignments"));
-          if (taSnap.exists() && courseKeys.size > 0) {
-            taSnap.forEach((child) => {
-              const val = child.val();
-              if (val && val.courseId && courseKeys.has(val.courseId) && val.teacherId) {
-                teacherIdsForStudent.add(val.teacherId);
-              }
-            });
+        // If cached student differs, recompute teacher assignment caches
+        if (cacheRef.current.studentNodeKey !== studentNodeKey || !cacheRef.current.teacherIdsForStudent) {
+          // Courses -> courseKeys
+          const courseKeys = new Set();
+          try {
+            const coursesSnap = await get(ref(database, "Courses"));
+            if (coursesSnap.exists() && studentGrade && studentSection) {
+              coursesSnap.forEach((c) => {
+                const val = c.val();
+                const key = c.key;
+                if (String(val.grade ?? "") === String(studentGrade) && String(val.section ?? "") === String(studentSection)) {
+                  courseKeys.add(key);
+                }
+              });
+            }
+          } catch (e) {
+            console.warn("Courses fetch failed", e);
           }
-        } catch (e) {
-          console.warn("TeacherAssignments fetch failed", e);
+
+          // TeacherAssignments -> teacherIdsForStudent
+          const teacherIdsForStudent = new Set();
+          try {
+            const taSnap = await get(ref(database, "TeacherAssignments"));
+            if (taSnap.exists() && courseKeys.size > 0) {
+              taSnap.forEach((child) => {
+                const val = child.val();
+                if (val && val.courseId && courseKeys.has(val.courseId) && val.teacherId) {
+                  teacherIdsForStudent.add(val.teacherId);
+                }
+              });
+            }
+          } catch (e) {
+            console.warn("TeacherAssignments fetch failed", e);
+          }
+
+          // Teachers node -> teacherId -> userNodeKey
+          const teacherNodeKeyMap = {};
+          try {
+            const teachersSnap = await get(ref(database, "Teachers"));
+            if (teachersSnap.exists()) {
+              teachersSnap.forEach((child) => {
+                const v = child.val();
+                const teacherId = v?.teacherId;
+                const userNode = v?.userId;
+                if (teacherId && userNode) teacherNodeKeyMap[teacherId] = userNode;
+              });
+            }
+          } catch (e) {
+            console.warn("Teachers fetch failed", e);
+          }
+
+          cacheRef.current.studentNodeKey = studentNodeKey;
+          cacheRef.current.teacherIdsForStudent = teacherIdsForStudent;
+          cacheRef.current.teacherNodeKeys = teacherNodeKeyMap;
         }
 
-        // 3) load Teachers node once and map teacherId -> Users nodeKey (userNodeKey)
-        const teacherNodeKeyMap = {}; // teacherId -> userNodeKey (Users node key)
+        // Build sets of teacher user node keys and admin keys
+        const teacherUserNodeKeys = new Set();
+        for (const tid of Array.from(cacheRef.current.teacherIdsForStudent || [])) {
+          const nodek = cacheRef.current.teacherNodeKeys?.[tid];
+          if (nodek) teacherUserNodeKeys.add(nodek);
+        }
+
+        const adminUserNodeKeys = new Set();
         try {
-          const teachersSnap = await get(ref(database, "Teachers"));
-          if (teachersSnap.exists()) {
-            teachersSnap.forEach((child) => {
+          const saSnap = await get(ref(database, "School_Admins"));
+          if (saSnap.exists()) {
+            saSnap.forEach((child) => {
               const v = child.val();
-              const teacherId = v?.teacherId;
-              const userNode = v?.userId; // your Teachers have userId which points to Users node key
-              if (teacherId && userNode) {
-                teacherNodeKeyMap[teacherId] = userNode;
-              }
+              if (v && v.userId) adminUserNodeKeys.add(v.userId);
             });
           }
         } catch (e) {
-          console.warn("Teachers fetch failed", e);
+          console.warn("School_Admins fetch failed", e);
         }
 
-        // store cache
-        cacheRef.current.studentNodeKey = studentNodeKey;
-        cacheRef.current.teacherIdsForStudent = teacherIdsForStudent;
-        cacheRef.current.teacherNodeKeys = teacherNodeKeyMap;
-      } // end caching resolution
+        // Load Users for union of node keys
+        const userNodeKeysToLoad = new Set([...Array.from(teacherUserNodeKeys), ...Array.from(adminUserNodeKeys)]);
+        const userProfiles = {};
+        await Promise.all(
+          Array.from(userNodeKeysToLoad).map(async (nodeKey) => {
+            try {
+              const snap = await get(ref(database, `Users/${nodeKey}`));
+              if (snap.exists()) userProfiles[nodeKey] = snap.val();
+            } catch (e) {
+              // ignore individual failures
+            }
+          })
+        );
 
-      // Build set of teacher user node keys assigned to this student
-      const teacherUserNodeKeys = new Set();
-      for (const tid of Array.from(cacheRef.current.teacherIdsForStudent || [])) {
-        const nodek = cacheRef.current.teacherNodeKeys?.[tid];
-        if (nodek) teacherUserNodeKeys.add(nodek);
-      }
-
-      // Admins: include all School_Admins (unchanged)
-      const adminUserNodeKeys = new Set();
-      try {
-        const saSnap = await get(ref(database, "School_Admins"));
-        if (saSnap.exists()) {
-          saSnap.forEach((child) => {
-            const v = child.val();
-            if (v && v.userId) adminUserNodeKeys.add(v.userId);
+        // Build contacts map
+        const contactsMap = new Map();
+        for (const nodeKey of Array.from(teacherUserNodeKeys)) {
+          const profile = userProfiles[nodeKey] || null;
+          contactsMap.set(nodeKey, {
+            nodeKey,
+            userId: profile?.userId || nodeKey,
+            name: profile?.name || profile?.username || "Teacher",
+            role: "Teacher",
+            profileImage: profile?.profileImage || null,
+            type: "teacher",
+            chatId: null,
+            lastMessage: null,
+            lastTime: null,
+            lastSenderId: null,
+            lastSeen: false,
+            unread: 0,
           });
         }
-      } catch (e) {
-        console.warn("School_Admins fetch failed", e);
-      }
+        for (const nodeKey of Array.from(adminUserNodeKeys)) {
+          if (contactsMap.has(nodeKey)) continue;
+          const profile = userProfiles[nodeKey] || null;
+          contactsMap.set(nodeKey, {
+            nodeKey,
+            userId: profile?.userId || nodeKey,
+            name: profile?.name || profile?.username || "Admin",
+            role: "Management",
+            profileImage: profile?.profileImage || null,
+            type: "management",
+            chatId: null,
+            lastMessage: null,
+            lastTime: null,
+            lastSenderId: null,
+            lastSeen: false,
+            unread: 0,
+          });
+        }
 
-      // Helper: load Users profiles in parallel for the union of node keys we need
-      const userNodeKeysToLoad = new Set([...Array.from(teacherUserNodeKeys), ...Array.from(adminUserNodeKeys)]);
-      const userProfiles = {}; // nodeKey -> profile
-      await Promise.all(
-        Array.from(userNodeKeysToLoad).map(async (nodeKey) => {
-          try {
-            const snap = await get(ref(database, `Users/${nodeKey}`));
-            if (snap.exists()) userProfiles[nodeKey] = snap.val();
-          } catch (e) {
-            // ignore individual failures
-          }
-        })
-      );
+        // Merge Chats metadata and set lastSenderId/lastSeen if present
+        try {
+          const chatsSnap = await get(ref(database, "Chats"));
+          if (chatsSnap.exists()) {
+            chatsSnap.forEach((child) => {
+              const chatKey = child.key;
+              const val = child.val();
+              const participants = val.participants || {};
+              const last = val.lastMessage || null;
+              const unreadObj = val.unread || {};
 
-      // Build contacts map (only assigned teachers + admins)
-      const contactsMap = new Map();
-      for (const nodeKey of Array.from(teacherUserNodeKeys)) {
-        const profile = userProfiles[nodeKey] || null;
-        contactsMap.set(nodeKey, {
-          nodeKey,
-          userId: profile?.userId || nodeKey,
-          name: profile?.name || profile?.username || "Teacher",
-          role: "Teacher",
-          profileImage: profile?.profileImage || null,
-          type: "teacher",
-          chatId: null,
-          lastMessage: null,
-          lastTime: null,
-          unread: 0,
-        });
-      }
-      for (const nodeKey of Array.from(adminUserNodeKeys)) {
-        if (contactsMap.has(nodeKey)) continue;
-        const profile = userProfiles[nodeKey] || null;
-        contactsMap.set(nodeKey, {
-          nodeKey,
-          userId: profile?.userId || nodeKey,
-          name: profile?.name || profile?.username || "Admin",
-          role: "Management",
-          profileImage: profile?.profileImage || null,
-          type: "management",
-          chatId: null,
-          lastMessage: null,
-          lastTime: null,
-          unread: 0,
-        });
-      }
-
-      // Merge Chats metadata and set unread counts for currentUserId
-      try {
-        const chatsSnap = await get(ref(database, "Chats"));
-        if (chatsSnap.exists()) {
-          chatsSnap.forEach((child) => {
-            const chatKey = child.key;
-            const val = child.val();
-            const participants = val.participants || {};
-            const last = val.lastMessage || null;
-            const unreadObj = val.unread || {};
-
-            // If currentUserId present, find other participant and attach metadata to contact whose userId === other
-            if (currentUserId && participants && participants[currentUserId]) {
-              const otherKeys = Object.keys(participants).filter((k) => k !== currentUserId);
-              if (otherKeys.length === 0) return;
-              const other = otherKeys[0];
-              // find contact whose userId matches other
-              for (const [k, contact] of contactsMap.entries()) {
-                if (String(contact.userId) === String(other)) {
-                  const existing = contactsMap.get(k);
-                  existing.chatId = chatKey;
-                  existing.lastMessage = last?.text || existing.lastMessage;
-                  existing.lastTime = last?.timeStamp || existing.lastTime;
-                  const unreadCount = Number(unreadObj[currentUserId] ?? 0);
-                  const lastSender = last?.senderId ?? null;
-                  existing.unread = lastSender && String(lastSender) === String(currentUserId) ? 0 : unreadCount;
-                  contactsMap.set(k, existing);
+              if (currentUserId && participants && participants[currentUserId]) {
+                const otherKeys = Object.keys(participants).filter((k) => k !== currentUserId);
+                if (otherKeys.length === 0) return;
+                const other = otherKeys[0];
+                for (const [k, contact] of contactsMap.entries()) {
+                  if (String(contact.userId) === String(other)) {
+                    const existing = contactsMap.get(k);
+                    existing.chatId = chatKey;
+                    existing.lastMessage = last?.text || existing.lastMessage;
+                    existing.lastTime = last?.timeStamp || existing.lastTime;
+                    existing.lastSenderId = last?.senderId ?? existing.lastSenderId;
+                    existing.lastSeen = typeof last?.seen === "boolean" ? last.seen : existing.lastSeen;
+                    const unreadCount = Number(unreadObj[currentUserId] ?? 0);
+                    const lastSender = last?.senderId ?? null;
+                    existing.unread = lastSender && String(lastSender) === String(currentUserId) ? 0 : unreadCount;
+                    contactsMap.set(k, existing);
+                  }
                 }
               }
+            });
+          }
+        } catch (e) {
+          console.warn("Chats merge failed", e);
+        }
+
+        // Convert to array
+        const serverArr = Array.from(contactsMap.values()).map((c) => ({
+          key: c.nodeKey,
+          userId: c.userId,
+          name: c.name,
+          role: c.role,
+          profileImage: c.profileImage,
+          type: c.type,
+          chatId: c.chatId,
+          lastMessage: c.lastMessage,
+          lastTime: c.lastTime,
+          lastSenderId: c.lastSenderId,
+          lastSeen: c.lastSeen,
+          unread: c.unread || 0,
+        }));
+
+        // Merge with cache: prefer newer lastTime (cache or server) per contact and keep cache-only entries
+        const rawCache = await AsyncStorage.getItem("chatsCache");
+        const cache = rawCache ? JSON.parse(rawCache) : [];
+        const cacheByKey = new Map();
+        for (const c of cache) {
+          const k = String(c.key || c.userId || "");
+          cacheByKey.set(k, c);
+        }
+
+        const merged = [];
+        for (const s of serverArr) {
+          const k = String(s.key || s.userId || "");
+          const cached = cacheByKey.get(k);
+          if (cached) {
+            const cachedTs = Number(cached.lastTime || 0);
+            const serverTs = Number(s.lastTime || 0);
+            if (cachedTs > serverTs) {
+              merged.push({
+                ...s,
+                name: s.name || cached.name,
+                profileImage: s.profileImage || cached.profileImage,
+                lastMessage: cached.lastMessage,
+                lastTime: cached.lastTime,
+                lastSenderId: cached.lastSenderId ?? s.lastSenderId,
+                lastSeen: typeof cached.lastSeen === "boolean" ? cached.lastSeen : s.lastSeen,
+                unread: cached.unread ?? s.unread ?? 0,
+              });
             } else {
-              // For chats where current user is not a participant, ignore for now.
+              merged.push(s);
             }
-          });
+            cacheByKey.delete(k);
+          } else {
+            merged.push(s);
+          }
+        }
+
+        // Add remaining cached-only entries
+        for (const [k, cached] of cacheByKey.entries()) {
+          merged.push(cached);
+        }
+
+        // Sort
+        merged.sort((a, b) => {
+          if ((b.unread || 0) - (a.unread || 0) !== 0) return (b.unread || 0) - (a.unread || 0);
+          const ta = a.lastTime ? Number(a.lastTime) : 0;
+          const tb = b.lastTime ? Number(b.lastTime) : 0;
+          if (tb - ta !== 0) return tb - ta;
+          return (a.name || "").localeCompare(b.name || "");
+        });
+
+        setContacts(merged);
+
+        try {
+          await AsyncStorage.setItem("chatsCache", JSON.stringify(merged));
+          await AsyncStorage.setItem("chatsCacheFetchedAt", String(Date.now()));
+          lastFetchedAtRef.current = Date.now();
+        } catch (e) {
+          // ignore
+        }
+      } catch (err) {
+        console.warn("loadData error", err);
+      } finally {
+        if (!background) setLoadingInitial(false);
+        setRefreshing(false);
+      }
+    },
+    [currentUserId, resolveCurrentUserId]
+  );
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const hadCache = await loadCacheAndShow();
+      try {
+        const fetchedAtStr = await AsyncStorage.getItem("chatsCacheFetchedAt");
+        const fetchedAt = fetchedAtStr ? Number(fetchedAtStr) : 0;
+        const now = Date.now();
+        if (!fetchedAt || now - fetchedAt > debounceWindowMs) {
+          loadData({ background: true });
+        } else {
+          lastFetchedAtRef.current = fetchedAt;
         }
       } catch (e) {
-        console.warn("Chats merge failed", e);
+        loadData({ background: true });
       }
-
-      // Convert to array
-      const arr = Array.from(contactsMap.values()).map((c) => ({
-        key: c.nodeKey,
-        userId: c.userId,
-        name: c.name,
-        role: c.role,
-        profileImage: c.profileImage,
-        type: c.type,
-        chatId: c.chatId,
-        lastMessage: c.lastMessage,
-        lastTime: c.lastTime,
-        unread: c.unread || 0,
-      }));
-
-      // Sort - unread first, then recent
-      arr.sort((a, b) => {
-        if ((b.unread || 0) - (a.unread || 0) !== 0) return (b.unread || 0) - (a.unread || 0);
-        const ta = a.lastTime ? Number(a.lastTime) : 0;
-        const tb = b.lastTime ? Number(b.lastTime) : 0;
-        if (tb - ta !== 0) return tb - ta;
-        return (a.name || "").localeCompare(b.name || "");
-      });
-
-      setContacts(arr);
-    } catch (err) {
-      console.warn("loadData error", err);
-      setContacts([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [currentUserId, resolveCurrentUserId]);
-
-  // initial effects
-  useEffect(() => {
-    (async () => {
-      const uNodeKey =
-        (await AsyncStorage.getItem("userNodeKey")) ||
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        null;
-      setCurrentUserNodeKey(uNodeKey);
-      const resolved = await resolveCurrentUserId();
-      setCurrentUserId(resolved || null);
     })();
-  }, [resolveCurrentUserId]);
+    return () => { mounted = false; };
+  }, [loadData]);
 
-  useEffect(() => {
-    loadData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentUserNodeKey, currentUserId]);
+  useFocusEffect(
+    useCallback(() => {
+      const now = Date.now();
+      if (now - (lastFetchedAtRef.current || 0) > debounceWindowMs) {
+        loadData({ background: true });
+      }
+    }, [loadData])
+  );
 
-  // onOpenChat: resolve contactUserId and deterministic chat id, store in chatStore then navigate
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    loadData({ background: false });
+  }, [loadData]);
+
   const onOpenChat = async (contact) => {
     if (!contact) return;
 
-    // resolve contactUserId
     let contactUserId = contact.userId || "";
     if (!contactUserId) {
       try {
@@ -367,7 +448,6 @@ export default function ChatsScreen() {
       }
     }
 
-    // resolve myUserId
     let myUserId = await AsyncStorage.getItem("userId");
     if (!myUserId) {
       const nodeKey =
@@ -386,7 +466,6 @@ export default function ChatsScreen() {
       }
     }
 
-    // try to find existing chat id deterministically
     let existingChatId = "";
     if (myUserId && contactUserId) {
       try {
@@ -414,7 +493,6 @@ export default function ChatsScreen() {
     router.push("/messages");
   };
 
-  // Filtered contacts per selected filter
   const filteredContacts = contacts.filter((c) => {
     if (filter === "All") return true;
     if (filter === "Management") return c.type === "management";
@@ -423,10 +501,9 @@ export default function ChatsScreen() {
     return true;
   });
 
-  // UI: If no assigned teachers at all, show a dedicated empty state
   const hasAssignedTeachers = contacts.some((c) => c.type === "teacher");
 
-  if (loading) {
+  if (loadingInitial && contacts.length === 0) {
     return (
       <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
         <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
@@ -437,7 +514,6 @@ export default function ChatsScreen() {
     );
   }
 
-  // If user selected filter "Teachers" and there are none, show message
   if (filter === "Teachers" && !hasAssignedTeachers) {
     return (
       <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
@@ -484,7 +560,6 @@ export default function ChatsScreen() {
     <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
       <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
       <View style={styles.container}>
-        {/* Header */}
         <View style={styles.headerRow}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
             <Ionicons name="chevron-back" size={22} color="#222" />
@@ -497,7 +572,6 @@ export default function ChatsScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* Filters */}
         <View style={styles.filterContainer}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
             {FILTERS.map((f) => (
@@ -513,7 +587,6 @@ export default function ChatsScreen() {
           </ScrollView>
         </View>
 
-        {/* Contacts */}
         {filteredContacts.length === 0 ? (
           <View style={styles.emptyWrap}>
             <Text style={styles.emptyTitle}>No contacts</Text>
@@ -523,30 +596,43 @@ export default function ChatsScreen() {
           <FlatList
             data={filteredContacts}
             keyExtractor={(it) => it.key}
-            renderItem={({ item }) => (
-              <TouchableOpacity style={styles.itemWrapper} onPress={() => onOpenChat(item)} activeOpacity={0.9}>
-                <View style={styles.row}>
-                  <Image source={item.profileImage ? { uri: item.profileImage } : AVATAR_PLACEHOLDER} style={styles.avatar} />
-                  <View style={{ flex: 1, marginLeft: 12 }}>
-                    <View style={styles.rowTop}>
-                      <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
-                        <Text style={styles.name} numberOfLines={1}>{item.name}</Text>
-                        {item.role ? <View style={styles.badge}><Text style={styles.badgeText}>{item.role}</Text></View> : null}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+            renderItem={({ item }) => {
+              const lastWasMine = item.lastSenderId && currentUserId && String(item.lastSenderId) === String(currentUserId);
+              const seenFlag = !!item.lastSeen;
+              return (
+                <TouchableOpacity style={styles.itemWrapper} onPress={() => onOpenChat(item)} activeOpacity={0.9}>
+                  <View style={styles.row}>
+                    <Image source={item.profileImage ? { uri: item.profileImage } : AVATAR_PLACEHOLDER} style={styles.avatar} />
+                    <View style={{ flex: 1, marginLeft: 12 }}>
+                      <View style={styles.rowTop}>
+                        <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
+                          <Text style={styles.name} numberOfLines={1}>{item.name}</Text>
+                          {item.role ? <View style={styles.badge}><Text style={styles.badgeText}>{item.role}</Text></View> : null}
+                        </View>
+
+                        <View style={{ alignItems: "flex-end", flexDirection: "row", alignItemsVertical: "center" }}>
+                          <Text style={styles.time}>{fmtTime12(item.lastTime)}</Text>
+                          <View style={{ width: 8 }} />
+                          {lastWasMine ? (
+                            <Ionicons
+                              name={seenFlag ? "checkmark-done" : "checkmark"}
+                              size={16}
+                              color={seenFlag ? PRIMARY : MUTED}
+                            />
+                          ) : null}
+                          {item.unread ? <View style={styles.unreadPill}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}
+                        </View>
                       </View>
 
-                      <View style={{ alignItems: "flex-end" }}>
-                        <Text style={styles.time}>{fmtTime(item.lastTime)}</Text>
-                        {item.unread ? <View style={styles.unreadPill}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}
+                      <View style={{ marginTop: 6 }}>
+                        <Text style={styles.subtitleText} numberOfLines={1}>{shortText(item.lastMessage || (item.role === "Teacher" ? "Tap to message your teacher" : "Start a conversation"))}</Text>
                       </View>
-                    </View>
-
-                    <View style={{ marginTop: 6 }}>
-                      <Text style={styles.subtitleText} numberOfLines={1}>{shortText(item.lastMessage || (item.role === "Teacher" ? "Tap to message your teacher" : "Start a conversation"))}</Text>
                     </View>
                   </View>
-                </View>
-              </TouchableOpacity>
-            )}
+                </TouchableOpacity>
+              );
+            }}
             ItemSeparatorComponent={renderSeparator}
             contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 20 }}
           />
