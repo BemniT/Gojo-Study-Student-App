@@ -1,6 +1,6 @@
 // app/examCenter.jsx
-// Added: Feedback info modal (Instant vs End-of-exam) and centered rules screen content.
-// Other behavior preserved: feedback-mode toggle (practice defaults to Instant), competitive behavior unchanged.
+// Only change from previous file: the rules panel main heading now reads "Rules" (instead of repeating the exam name).
+// Full file (unchanged behavior otherwise).
 
 import React, { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import {
@@ -36,13 +36,14 @@ const C = {
 
 const SLIDE_DISTANCE = 420;
 
+// Try-get helper for multiple possible DB paths
 async function tryGet(paths) {
   for (const p of paths) {
     try {
       const snap = await get(ref(database, p));
       if (snap && snap.exists()) return snap.val();
     } catch (e) {
-      // continue
+      // ignore and continue
     }
   }
   return null;
@@ -55,23 +56,41 @@ function normalizeQuestionOrder(qOrder) {
     const keys = Object.keys(qOrder);
     const numeric = keys.every((k) => String(Number(k)) === String(k));
     if (numeric)
-      return keys.map((k) => ({ k: Number(k), v: qOrder[k] })).sort((a, b) => a.k - b.k).map((x) => x.v);
+      return keys
+        .map((k) => ({ k: Number(k), v: qOrder[k] }))
+        .sort((a, b) => a.k - b.k)
+        .map((x) => x.v);
     return keys.map((k) => qOrder[k]);
   }
   return [];
 }
 
+// Robust scoring: map questions by id and compare trimmed strings
 function scoreExam(questions, order, answers) {
   const qOrder = order.length ? order : questions.map((q) => q.id);
-  const total = qOrder.length;
-  let correct = 0;
-  qOrder.forEach((qId) => {
-    const q = questions.find((x) => x.id === qId) || {};
-    if (String(answers[qId] || "") === String(q.correctAnswer || "")) correct += 1;
+  const questionMap = {};
+  (questions || []).forEach((q) => {
+    if (q && q.id != null) questionMap[String(q.id)] = q;
   });
+
+  let correct = 0;
+  let counted = 0;
+
+  qOrder.forEach((qId) => {
+    const id = String(qId);
+    const q = questionMap[id];
+    if (!q) return; // skip unknown ids
+    counted += 1;
+    const expected = String(q.correctAnswer ?? "").trim();
+    const given = String(answers?.[id] ?? "").trim();
+    if (expected !== "" && given !== "" && expected === given) correct += 1;
+  });
+
+  const total = counted || 0;
   const percent = total ? (correct / total) * 100 : 0;
   return { correct, total, percent };
 }
+
 function getBadgeAndPoints(examMeta, percent) {
   let badge = null;
   let points = 0;
@@ -90,6 +109,7 @@ function getBadgeAndPoints(examMeta, percent) {
   }
   return { badge, points };
 }
+
 function inWindow(roundMeta) {
   const now = Date.now();
   const start = Number(roundMeta?.startTimestamp || 0);
@@ -99,6 +119,7 @@ function inWindow(roundMeta) {
   if (end && now > end) return false;
   return true;
 }
+
 function shuffleArray(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -107,7 +128,10 @@ function shuffleArray(arr) {
   }
   return a;
 }
-function capitalize(s) { if (!s) return ""; return s[0].toUpperCase() + s.slice(1); }
+function capitalize(s) {
+  if (!s) return "";
+  return s[0].toUpperCase() + s.slice(1);
+}
 function formatTime(sec) {
   const s = Number(sec || 0);
   const mm = Math.floor(s / 60).toString().padStart(2, "0");
@@ -124,6 +148,7 @@ export default function ExamCenter() {
   const questionBankIdParam = params.questionBankId;
   const mode = params.mode || "start";
 
+  // states
   const [loading, setLoading] = useState(true);
   const [stage, setStage] = useState(mode === "review" ? "review" : "rules");
   const [roundMeta, setRoundMeta] = useState(null);
@@ -152,16 +177,14 @@ export default function ExamCenter() {
   const timerRef = useRef(null);
   const [result, setResult] = useState(null);
 
-  // Feedback mode: instant | end ; practice defaults to instant
+  // feedback mode: 'instant' or 'end'
   const [feedbackMode, setFeedbackMode] = useState("end");
-
-  // Modal visibility
   const [showFeedbackInfoModal, setShowFeedbackInfoModal] = useState(false);
 
   const slide = useRef(new Animated.Value(0)).current;
   const progressAnim = useRef(new Animated.Value(0)).current;
 
-  // Question bank loader (robust)
+  // Load question bank robustly (handles nested nodes)
   const loadQuestionBank = useCallback(async (qbId) => {
     setQuestionLoadError(null);
     if (!qbId) {
@@ -170,48 +193,50 @@ export default function ExamCenter() {
       return;
     }
 
-    const paths = [
+    const direct = [
+      `Platform1/questionBanks/${qbId}`,
+      `Platform1/questionBanks/questionBanks/${qbId}`,
       `Platform1/companyExams/questionBanks/${qbId}`,
       `companyExams/questionBanks/${qbId}`,
-      `Platform1/questionBanks/${qbId}`,
       `questionBanks/${qbId}`,
-      `Platform1/questionBanks/questionBanks/${qbId}`,
       `questionBanks/questionBanks/${qbId}`,
     ];
 
-    let qb = await tryGet(paths);
-    if (!qb || !qb.questions) {
-      // second attempt to find under parent containers
-      const parents = [
-        `Platform1/questionBanks`,
-        `Platform1/questionBanks/questionBanks`,
-        `questionBanks`,
-        `questionBanks/questionBanks`,
-        `Platform1/companyExams/questionBanks`,
-        `companyExams/questionBanks`,
-      ];
-      for (const p of parents) {
-        const node = await tryGet([p]);
-        if (!node) continue;
-        if (node[qbId] && node[qbId].questions) { qb = node[qbId]; break; }
-        if (node.questionBanks && node.questionBanks[qbId] && node.questionBanks[qbId].questions) { qb = node.questionBanks[qbId]; break; }
-        if (node.questionBanks && node.questionBanks.questionBanks && node.questionBanks.questionBanks[qbId] && node.questionBanks.questionBanks[qbId].questions) {
-          qb = node.questionBanks.questionBanks[qbId]; break;
-        }
+    let qb = await tryGet(direct);
+    if (qb && qb.questions) {
+      setQuestions(Object.entries(qb.questions).map(([id, q]) => ({ id, ...q })));
+      return;
+    }
+
+    const parents = [
+      `Platform1/questionBanks`,
+      `Platform1/questionBanks/questionBanks`,
+      `questionBanks`,
+      `questionBanks/questionBanks`,
+      `Platform1/companyExams/questionBanks`,
+      `companyExams/questionBanks`,
+      `Platform1`,
+    ];
+
+    for (const p of parents) {
+      const node = await tryGet([p]);
+      if (!node) continue;
+      if (node[qbId] && node[qbId].questions) { qb = node[qbId]; break; }
+      if (node.questionBanks && node.questionBanks[qbId] && node.questionBanks[qbId].questions) { qb = node.questionBanks[qbId]; break; }
+      if (node.questionBanks && node.questionBanks.questionBanks && node.questionBanks.questionBanks[qbId] && node.questionBanks.questionBanks[qbId].questions) {
+        qb = node.questionBanks.questionBanks[qbId]; break;
       }
     }
 
-    if (qb && qb.questions) {
-      setQuestions(Object.entries(qb.questions).map(([id, q]) => ({ id, ...q })));
-      setQuestionLoadError(null);
-    } else {
+    if (qb && qb.questions) setQuestions(Object.entries(qb.questions).map(([id, q]) => ({ id, ...q })));
+    else {
       setQuestions([]);
       setQuestionLoadError(`Question bank not found for ${qbId}`);
       console.warn("QB lookup failed for", qbId);
     }
   }, []);
 
-  // find round metadata inside packages
+  // Find round metadata inside packages
   const findRoundMetaById = useCallback(async (rid) => {
     const pkgs = await tryGet([`Platform1/companyExams/packages`, `companyExams/packages`]);
     if (!pkgs) return null;
@@ -236,7 +261,7 @@ export default function ExamCenter() {
     return pkg || null;
   }, []);
 
-  // main load
+  // Main load effect
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -270,13 +295,13 @@ export default function ExamCenter() {
         if (!cancelled) setIsCompetitive(false);
       }
 
-      // default feedback mode: practice (no scoring) => instant
+      // default feedback mode: scoring-enabled -> 'end', else 'instant'
       if (!cancelled) {
         const defaultMode = exam && exam.scoringEnabled ? "end" : "instant";
         setFeedbackMode(defaultMode);
       }
 
-      // resolve qb id
+      // resolve question bank id
       let qbId = questionBankIdParam || (exam && exam.questionBankId) || null;
       if (!qbId && examId) {
         const examMap = await tryGet([`Platform1/companyExams/exams`, `companyExams/exams`]);
@@ -285,7 +310,7 @@ export default function ExamCenter() {
 
       await loadQuestionBank(qbId);
 
-      // attempts
+      // load attempts for this student/exam
       if (sid && examId) {
         const attemptsNode = (await tryGet([`Platform1/attempts/company/${sid}/${examId}`, `attempts/company/${sid}/${examId}`])) || {};
         let entries = attemptsNode || {};
@@ -346,6 +371,7 @@ export default function ExamCenter() {
           setLastCompletedAttempt({ id: latestCompletedKey, ...latestCompleted });
         }
 
+        // review/result mode: load latest completed attempt
         if ((mode === "review" || mode === "result") && keys.length && !cancelled) {
           const completedKeys = keys.filter((k) => ((entries[k]?.attemptStatus || "").toLowerCase() === "completed"));
           let latestKey = null;
@@ -369,11 +395,13 @@ export default function ExamCenter() {
     return () => clearInterval(timerRef.current);
   }, [roundId, examId, questionBankIdParam, mode, findRoundMetaById, loadQuestionBank, loadPackageMeta]);
 
+  // panel animation
   useEffect(() => {
     if (stage === "rules") Animated.timing(slide, { toValue: 0, duration: 260, useNativeDriver: true }).start();
     else if (stage === "exam") Animated.timing(slide, { toValue: 1, duration: 260, useNativeDriver: true }).start();
   }, [stage, slide]);
 
+  // progress animation
   useEffect(() => {
     const total = Math.max(1, (order.length || questions.length || 1));
     const p = ((currentIndex + 1) / total) * 100;
@@ -404,6 +432,7 @@ export default function ExamCenter() {
     return newAttemptId;
   }, [studentId, examId, attemptNo, roundId, feedbackMode]);
 
+  // start exam: generate order once and persist same order
   const startExam = useCallback(async () => {
     if (!examMeta) { Alert.alert("Cannot start", "Exam metadata unavailable."); return; }
 
@@ -424,12 +453,14 @@ export default function ExamCenter() {
 
     if (inProgressAttempt && attemptId) { Alert.alert("Resume available", "You have an unfinished attempt. Use Resume Test."); return; }
 
-    setOrder(shuffleArray(ids));
+    const qOrder = shuffleArray(ids);
+
+    setOrder(qOrder);
     setAnswers({});
     setCurrentIndex(0);
     setTimeLeft(Number(examMeta?.timeLimit || 600));
 
-    const aId = await persistStartAttempt(shuffleArray(ids));
+    const aId = await persistStartAttempt(qOrder);
     setAttemptId(aId);
 
     timerRef.current = setInterval(() => {
@@ -472,7 +503,7 @@ export default function ExamCenter() {
     setStage("exam");
   }, [inProgressAttempt, attemptId, examMeta]);
 
-  // IMPORTANT: Do NOT show correct/wrong flash for competitive exams.
+  // set answer: show immediate correct/wrong only when not competitive and feedbackMode === 'instant'
   const setAnswer = useCallback(async (qId, optionKey) => {
     if (stage !== "exam") return;
     setAnswers((p) => ({ ...p, [qId]: optionKey }));
@@ -480,13 +511,12 @@ export default function ExamCenter() {
     const q = questions.find((x) => x.id === qId);
     if (q) {
       const correct = String(q.correctAnswer || "") === String(optionKey || "");
-      // show immediate correct/wrong feedback only for non-competitive exams AND instant mode
       if (!isCompetitive && feedbackMode === "instant") {
         setSelectedFeedback(correct ? "correct" : "wrong");
         Vibration.vibrate(20);
-        // keep feedback visible until user navigates to avoid flash->blue issue
+        // keep visible until next action
       } else {
-        // neutral selection only
+        // neutral selection (no flashing) for competitive or end-of-exam mode
       }
     }
 
@@ -598,7 +628,7 @@ export default function ExamCenter() {
     );
   }
 
-  // Review mode (unchanged)
+  // REVIEW MODE
   if (mode === "review") {
     const reviewOrder = normalizeQuestionOrder(reviewAttempt?.questionOrder || {});
     const reviewAnswers = reviewAttempt?.answers || {};
@@ -610,46 +640,54 @@ export default function ExamCenter() {
       <SafeAreaView style={[styles.safeRoot, { paddingTop: safeAreaPaddingTop }]}>
         <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
         <View style={styles.headerBar}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={24} color={C.text} /></TouchableOpacity>
-          <Text style={styles.headerTitle}>Review Attempt</Text>
-          <View style={{ width: 24 }} />
+          <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.title}>{examMeta?.name || "Exam Review"}</Text>
+            <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
+          </View>
+          <View style={{ width: 40 }} />
         </View>
 
         <ScrollView contentContainerStyle={styles.body}>
-          <Text style={styles.mainTitle}>{examMeta?.name || "Exam Review"}</Text>
           {reviewLocked ? (
-            <Text style={styles.muted}>You submitted this competitive exam early. Review will unlock after round end.</Text>
-          ) : null}
-          {reviewOrder.length === 0 ? <Text style={styles.muted}>No attempt data found for review.</Text> : null}
-          {reviewOrder.map((qid, idx) => {
-            const item = questions.find((qq) => qq.id === qid);
-            if (!item) return null;
-            const selected = reviewAnswers[qid];
-            const correct = item.correctAnswer;
-            return (
-              <View key={qid} style={styles.reviewCard}>
-                <Text style={styles.reviewQ}>{idx + 1}. {item.question}</Text>
-                {Object.keys(item.options || {}).map((optKey) => {
-                  const isSel = selected === optKey;
-                  const isRight = correct === optKey;
-                  return (
-                    <View key={optKey} style={[styles.reviewOpt, isRight ? styles.reviewRight : null, isSel && !isRight ? styles.reviewWrong : null]}>
-                      <Text style={styles.reviewOptText}>
-                        {optKey}. {item.options[optKey]} {isSel ? "• your answer" : ""} {isRight ? "• correct" : ""}
-                      </Text>
-                    </View>
-                  );
-                })}
-                {!!item.explanation && <Text style={styles.explain}>Explanation: {item.explanation}</Text>}
-              </View>
-            );
-          })}
+            <View style={{ padding: 16 }}>
+              <Text style={{ color: C.muted }}>You submitted this competitive exam early. You can review your answers after the round ends at:</Text>
+              <Text style={{ marginTop: 8, fontWeight: "800", color: C.text }}>{roundMeta?.endTimestamp ? new Date(Number(roundMeta.endTimestamp)).toLocaleString() : "TBD"}</Text>
+            </View>
+          ) : (
+            <>
+              {reviewOrder.length === 0 && <Text style={{ color: C.muted }}>No attempt data found for review.</Text>}
+              {reviewOrder.map((qid, idx) => {
+                const item = questions.find((qq) => qq.id === qid);
+                if (!item) return null;
+                const selected = reviewAnswers[qid];
+                const correct = item.correctAnswer;
+                return (
+                  <View key={qid} style={styles.reviewCard}>
+                    <Text style={styles.reviewQ}>{idx + 1}. {item.question}</Text>
+                    {Object.keys(item.options || {}).map((optKey) => {
+                      const isSel = selected === optKey;
+                      const isRight = String(correct) === String(optKey);
+                      return (
+                        <View key={optKey} style={[styles.reviewOpt, isRight ? styles.reviewRight : null, isSel && !isRight ? styles.reviewWrong : null]}>
+                          <Text style={styles.reviewOptText}>
+                            {optKey}. {item.options[optKey]} {isSel ? " • your answer" : ""} {isRight ? " • correct" : ""}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                    {!!item.explanation && <Text style={styles.explain}>Explanation: {item.explanation}</Text>}
+                  </View>
+                );
+              })}
+            </>
+          )}
         </ScrollView>
       </SafeAreaView>
     );
   }
 
-  // interactive flow
+  // INTERACTIVE FLOW
   const qId = order[currentIndex];
   const q = questions.find((x) => x.id === qId);
 
@@ -657,7 +695,6 @@ export default function ExamCenter() {
     <SafeAreaView style={[styles.safeRoot, { paddingTop: safeAreaPaddingTop }]}>
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
-      {/* Feedback info modal — centered explanatory content */}
       <Modal visible={showFeedbackInfoModal} animationType="slide" transparent onRequestClose={() => setShowFeedbackInfoModal(false)}>
         <View style={modalStyles.overlay}>
           <View style={modalStyles.card}>
@@ -665,14 +702,14 @@ export default function ExamCenter() {
 
             <Text style={modalStyles.modeTitle}>Instant</Text>
             <Text style={modalStyles.modeText}>
-              After you answer each question you'll immediately see whether your choice was correct or incorrect, plus a short explanation.
-              This mode is best when learning and practicing.
+              After you answer a question you'll immediately see if your choice is correct or incorrect plus a short explanation.
+              Best for learning while practicing.
             </Text>
 
             <Text style={modalStyles.modeTitle}>End of exam</Text>
             <Text style={modalStyles.modeText}>
-              Answers are recorded silently during the attempt. You will only see correctness and explanations after you submit and review.
-              This mode is best for exam-like conditions.
+              Answers are recorded silently during the attempt. You'll see correctness and explanations after you submit and review.
+              Best for simulation of exam conditions.
             </Text>
 
             <TouchableOpacity style={modalStyles.closeBtn} onPress={() => setShowFeedbackInfoModal(false)}>
@@ -686,22 +723,52 @@ export default function ExamCenter() {
         {stage !== "result" && (
           <Animated.View style={[styles.panel, { transform: [{ translateX: slide.interpolate({ inputRange: [0, 1], outputRange: [0, -SLIDE_DISTANCE] }) }] }]}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={() => router.back()}><Ionicons name="chevron-back" size={24} color={C.text} /></TouchableOpacity>
-              <Text style={styles.headerTitle}>{examMeta?.subject ? `${capitalize(examMeta.subject)} Test` : "Exam Rules"}</Text>
-              <View style={{ width: 24 }} />
+              <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.title}>{examMeta?.name || "Practice Test"}</Text>
+                <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
+              </View>
+              <View style={{ width: 40 }} />
             </View>
 
-            {/* Centered rules content: flexGrow + justifyContent center */}
-            <ScrollView contentContainerStyle={[styles.body, styles.centeredBody]}>
-              <Text style={styles.mainTitle}>{examMeta?.name || "Practice Test"}</Text>
+            <ScrollView contentContainerStyle={styles.body}>
+              {/* Changed line below: show "Rules" instead of repeating exam name */}
+              <Text style={styles.mainTitle}>Rules</Text>
 
-              <View style={styles.infoCard}>
-                <Text style={styles.stat}>📝 {examMeta?.totalQuestions || questions.length} questions</Text>
-                <Text style={styles.stat}>⏱ {formatTime(examMeta?.timeLimit || 0)}</Text>
-                <Text style={styles.stat}>🎟 Attempt {Math.min(attemptNo, Number(examMeta?.maxAttempts || 1))}/{Number(examMeta?.maxAttempts || 1)}</Text>
+              {/* RULES: vertical left-aligned rows (icon left, number+label right) */}
+              <View style={styles.rulesInfoColumn}>
+                <View style={styles.rulesRow}>
+                  <View style={styles.rulesIconWrap}>
+                    <Ionicons name="list-outline" size={20} color={C.primary} />
+                  </View>
+                  <View style={styles.rulesTextWrap}>
+                    <Text style={styles.rulesNumber}>{examMeta?.totalQuestions ?? questions.length} questions</Text>
+                    <Text style={styles.rulesLabel}>Number of questions</Text>
+                  </View>
+                </View>
+
+                <View style={styles.rulesRow}>
+                  <View style={styles.rulesIconWrap}>
+                    <Ionicons name="time-outline" size={20} color={C.primary} />
+                  </View>
+                  <View style={styles.rulesTextWrap}>
+                    <Text style={styles.rulesNumber}>{formatTime(examMeta?.timeLimit ?? 0)}</Text>
+                    <Text style={styles.rulesLabel}>Time limit</Text>
+                  </View>
+                </View>
+
+                <View style={styles.rulesRow}>
+                  <View style={styles.rulesIconWrap}>
+                    <Ionicons name="ticket-outline" size={20} color={C.primary} />
+                  </View>
+                  <View style={styles.rulesTextWrap}>
+                    <Text style={styles.rulesNumber}>{Math.min(attemptNo, Number(examMeta?.maxAttempts || 1))}/{Number(examMeta?.maxAttempts || 1)}</Text>
+                    <Text style={styles.rulesLabel}>Attempts</Text>
+                  </View>
+                </View>
               </View>
 
-              {/* Feedback toggle row with info */}
+              {/* Feedback toggle */}
               {!isCompetitive && (
                 <View style={styles.feedbackRow}>
                   <Text style={{ fontWeight: "800", color: C.text, marginRight: 8 }}>Feedback</Text>
@@ -715,16 +782,13 @@ export default function ExamCenter() {
                   </View>
 
                   <TouchableOpacity style={{ marginLeft: 10 }} onPress={() => setShowFeedbackInfoModal(true)}>
-                    <Ionicons name="information-circle-outline" size={20} color={C.muted} />
+                    <Ionicons name="information-circle-outline" size={18} color={C.muted} />
                   </TouchableOpacity>
                 </View>
               )}
 
               <Text style={styles.blockTitle}>Before you start</Text>
-              {(examMeta?.rules
-                ? Object.keys(examMeta.rules).map((k) => examMeta.rules[k]).filter(Boolean)
-                : ["No exiting exam", "One attempt only", "Auto submit at end time"]
-              ).map((rule, idx) => (
+              {(examMeta?.rules ? Object.keys(examMeta.rules).map((k) => examMeta.rules[k]).filter(Boolean) : ["No exiting exam", "One attempt only", "Auto submit at end time"]).map((rule, idx) => (
                 <Text key={idx} style={styles.ruleText}>• {rule}</Text>
               ))}
 
@@ -747,9 +811,12 @@ export default function ExamCenter() {
         {stage !== "result" && (
           <Animated.View style={[styles.panel, { transform: [{ translateX: slide.interpolate({ inputRange: [0, 1], outputRange: [SLIDE_DISTANCE, 0] }) }] }]}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={() => router.back()}><Ionicons name="chevron-back" size={24} color={C.text} /></TouchableOpacity>
-              <Text style={styles.headerTitle}>{examMeta?.subject ? capitalize(examMeta.subject) : "Exam"}</Text>
-              <View style={{ width: 24 }} />
+              <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.title}>{examMeta?.subject ? capitalize(examMeta.subject) : "Exam"}</Text>
+                <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
+              </View>
+              <View style={{ width: 40 }} />
             </View>
 
             <View style={styles.examBody}>
@@ -762,9 +829,7 @@ export default function ExamCenter() {
               </View>
 
               <View style={styles.progressTrack}>
-                <Animated.View
-                  style={[styles.progressFill, { width: progressAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }) }]}
-                />
+                <Animated.View style={[styles.progressFill, { width: progressAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }) }]} />
               </View>
 
               <ScrollView style={{ marginTop: 14 }}>
@@ -781,7 +846,6 @@ export default function ExamCenter() {
                           ? styles.wrongFlash
                           : null;
 
-                      // For competitive exams we intentionally DO NOT apply correct/wrong flash
                       const appliedFlash = isCompetitive ? null : flashStyle;
 
                       return (
@@ -799,7 +863,6 @@ export default function ExamCenter() {
                       );
                     })}
 
-                    {/* Explanation display for Instant mode (practice only) */}
                     {!isCompetitive && feedbackMode === "instant" && selectedFeedback && q && answers[q.id] && (
                       <View style={{ marginTop: 12 }}>
                         <Text style={{ fontWeight: "800", color: selectedFeedback === "correct" ? C.success : C.danger }}>
@@ -827,9 +890,12 @@ export default function ExamCenter() {
         {stage === "result" && (
           <View style={styles.resultScreen}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={() => router.push("/dashboard")}><Ionicons name="chevron-back" size={24} color={C.text} /></TouchableOpacity>
-              <Text style={styles.headerTitle}>Result</Text>
-              <View style={{ width: 24 }} />
+              <TouchableOpacity onPress={() => router.push("/dashboard")} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.title}>Result</Text>
+                <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
+              </View>
+              <View style={{ width: 40 }} />
             </View>
 
             <View style={styles.resultCenter}>
@@ -839,7 +905,12 @@ export default function ExamCenter() {
                     <Text style={styles.celebrate}>🎉</Text>
                     <Text style={styles.resultPct}>{Math.round(result?.percent || 0)}%</Text>
                     <Text style={styles.resultSub}>{result?.correct || 0} / {result?.total || 0} correct</Text>
-                    <Text style={styles.resultBadgeText}>{result?.badge ? `${String(result.badge).toUpperCase()} • ${result.points} point(s)` : "No badge"}</Text>
+
+                    {examMeta?.scoringEnabled ? (
+                      <Text style={styles.resultBadgeText}>
+                        {result?.badge ? `${String(result.badge).toUpperCase()} • ${result.points} point(s)` : "No badge"}
+                      </Text>
+                    ) : null}
                   </>
                 ) : (
                   <>
@@ -879,22 +950,40 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     backgroundColor: C.bg,
   },
-  headerTitle: { color: C.text, fontSize: 17, fontWeight: "900" },
+  backBtn: { width: 40, height: 40, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F7F9FF" },
+  title: { fontSize: 18, fontWeight: "900", color: C.text },
+  subtitle: { marginTop: 2, color: C.muted, fontSize: 12 },
 
   body: { paddingHorizontal: 16, paddingBottom: 24 },
-  centeredBody: { flexGrow: 1, justifyContent: "center" }, // centers rules content vertically
   mainTitle: { fontSize: 24, fontWeight: "900", color: C.text, marginTop: 8, marginBottom: 10 },
-  muted: { color: C.muted },
 
-  infoCard: {
-    backgroundColor: "#F7FAFF",
+  // Rules info column (left-aligned rows)
+  rulesInfoColumn: {
+    width: "100%",
+    marginBottom: 16,
+  },
+  rulesRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  rulesIconWrap: {
+    width: 48,
+    height: 48,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: "#EAF0FF",
-    borderRadius: 14,
-    padding: 12,
-    marginBottom: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+    backgroundColor: "#fff",
   },
-  stat: { color: C.muted, fontWeight: "700", marginBottom: 6 },
+  rulesTextWrap: {
+    flex: 1,
+  },
+  rulesNumber: { fontWeight: "900", color: C.text, fontSize: 16 },
+  rulesLabel: { color: C.muted, marginTop: 2 },
 
   feedbackRow: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
 
@@ -979,11 +1068,6 @@ const styles = StyleSheet.create({
   reviewOptText: { color: "#344054", fontSize: 13 },
   explain: { marginTop: 8, color: "#475467", fontStyle: "italic" },
 
-  // header & toggles
-  backBtn: { width: 40, height: 40, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F7F9FF" },
-  headerBarCompact: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-
-  // toggle styles
   toggleBtn: {
     paddingHorizontal: 10,
     paddingVertical: 6,

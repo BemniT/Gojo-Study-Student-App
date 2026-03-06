@@ -26,8 +26,9 @@ const PRIMARY = "#0B72FF";
 const BG = "#FFFFFF";
 const TEXT = "#0B2540";
 const MUTED = "#6B78A8";
-const HEART_REFILL_MS = 20 * 60 * 1000; // 20 minutes
+const HEART_REFILL_MS = 20 * 60 * 1000; // fallback 20 minutes
 const DEFAULT_GLOBAL_MAX_LIVES = 5;
+const HEART_COLOR = "#EF4444";
 
 async function tryGet(paths) {
   for (const p of paths) {
@@ -58,10 +59,10 @@ function formatTimeLeft(ms) {
  *
  * - load() runs only when packageId or incomingGrade changes
  * - nowTs is updated every second to drive UI timers only
- * - remainingHearts and nextHeartInMs are computed on render using nowTs
+ * - remainingHearts and nextHeartInMs are computed on render using nowTs and refillMs
  *
- * Fix: competitive packages do NOT show refill countdown - they are one-attempt rules.
- * Also load & show global lives (if available).
+ * Competitive packages: no refill
+ * Global lives: shown only here (header) as a single heart icon + numeric counter
  */
 
 export default function PackageSubjects() {
@@ -80,6 +81,7 @@ export default function PackageSubjects() {
   // global lives
   const [globalLives, setGlobalLives] = useState(null);
   const [globalMaxLives, setGlobalMaxLives] = useState(DEFAULT_GLOBAL_MAX_LIVES);
+  const [globalRefillMs, setGlobalRefillMs] = useState(HEART_REFILL_MS);
 
   // ticking clock for UI timers (does NOT trigger reload)
   const [nowTs, setNowTs] = useState(Date.now());
@@ -120,16 +122,30 @@ export default function PackageSubjects() {
     if (sid) {
       const livesNode = await tryGet([`Platform1/studentLives/${sid}`, `studentLives/${sid}`]);
       if (livesNode) {
-        const lives = typeof livesNode === "object" ? (livesNode.lives ?? null) : null;
-        const max = typeof livesNode === "object" ? (livesNode.maxLives ?? DEFAULT_GLOBAL_MAX_LIVES) : DEFAULT_GLOBAL_MAX_LIVES;
-        setGlobalLives(Number(lives ?? 0));
-        setGlobalMaxLives(Number(max || DEFAULT_GLOBAL_MAX_LIVES));
+        // livesNode may be snapshot or value object depending on tryGet result
+        const raw = typeof livesNode.val === "function" ? livesNode.val() : livesNode;
+        const lives = Number(raw?.currentLives ?? raw?.lives ?? null);
+        const max = Number(raw?.maxLives ?? DEFAULT_GLOBAL_MAX_LIVES);
+        // refillIntervalMs may be presented in seconds or ms; normalize:
+        let refillRaw = raw?.refillIntervalMs ?? raw?.refillInterval ?? null;
+        let refillMs = HEART_REFILL_MS;
+        if (refillRaw != null) {
+          const num = Number(refillRaw);
+          if (!Number.isFinite(num)) refillMs = HEART_REFILL_MS;
+          else refillMs = num > 1000 ? num : num * 1000;
+        }
+        setGlobalLives(Number.isFinite(lives) ? lives : null);
+        setGlobalMaxLives(Number.isFinite(max) ? max : DEFAULT_GLOBAL_MAX_LIVES);
+        setGlobalRefillMs(refillMs);
       } else {
         setGlobalLives(null);
         setGlobalMaxLives(DEFAULT_GLOBAL_MAX_LIVES);
+        setGlobalRefillMs(HEART_REFILL_MS);
       }
     } else {
       setGlobalLives(null);
+      setGlobalMaxLives(DEFAULT_GLOBAL_MAX_LIVES);
+      setGlobalRefillMs(HEART_REFILL_MS);
     }
 
     // if package has grade and it doesn't match student's grade, show empty
@@ -164,7 +180,8 @@ export default function PackageSubjects() {
             `Platform1/studentProgress/${sid}/company/${rid}/${examId}`,
             `studentProgress/${sid}/company/${rid}/${examId}`,
           ]);
-          if (pSnap && pSnap.exists()) progressRaw = pSnap.val();
+          if (pSnap && pSnap.exists) progressRaw = typeof pSnap.val === "function" ? pSnap.val() : pSnap;
+          else if (pSnap) progressRaw = pSnap;
         }
 
         const maxAttempts = Number(examMeta.maxAttempts || 1);
@@ -211,8 +228,8 @@ export default function PackageSubjects() {
   };
 
   // derive hearts & next-heart countdown for a round (pure function)
-  // IMPORTANT: For competitive packages there is NO refill -> return no nextHeartInMs and static remaining
-  function deriveHearts(round, now = Date.now()) {
+  // If refillMs is provided it is used; otherwise fallback to HEART_REFILL_MS
+  function deriveHearts(round, now = Date.now(), refillMs = HEART_REFILL_MS) {
     const maxAttempts = Number(round.maxAttempts || 1);
     const used = Number(round.attemptsUsedRaw || 0);
     const lastTs = Number(round.lastAttemptTsRaw || 0);
@@ -230,7 +247,7 @@ export default function PackageSubjects() {
     }
 
     // how many refill cycles since last attempt
-    const recovered = Math.floor((now - lastTs) / HEART_REFILL_MS);
+    const recovered = Math.floor((now - lastTs) / refillMs);
     const effectiveUsed = Math.max(0, used - recovered);
     const remainingHearts = Math.max(0, maxAttempts - effectiveUsed);
 
@@ -238,7 +255,7 @@ export default function PackageSubjects() {
     if (remainingHearts < maxAttempts) {
       const elapsedSinceLast = now - lastTs;
       // next refill occurs at refillMs - (elapsedSinceLast % refillMs)
-      nextHeartInMs = HEART_REFILL_MS - (elapsedSinceLast % HEART_REFILL_MS);
+      nextHeartInMs = refillMs - (elapsedSinceLast % refillMs);
     }
 
     return { remainingHearts, nextHeartInMs, competitive: false };
@@ -271,12 +288,18 @@ export default function PackageSubjects() {
           <Text style={styles.subtitle}>Choose a subject and start a round</Text>
         </View>
 
-        {/* Global lives preview */}
-        <View style={{ alignItems: "flex-end" }}>
-          <Text style={{ color: MUTED, fontWeight: "800" }}>Lives</Text>
-          <Text style={{ color: PRIMARY, fontWeight: "900" }}>
-            {globalLives != null ? `${"❤️".repeat(Math.max(0, Math.min(globalLives, 5)))} ${globalLives}` : `— / ${globalMaxLives}`}
-          </Text>
+        {/* Global lives preview: single linear heart + number */}
+        <View style={{ alignItems: "flex-end", minWidth: 60 }}>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <Ionicons
+              name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"}
+              size={20}
+              color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED}
+            />
+            <Text style={{ marginLeft: 6, color: PRIMARY, fontWeight: "900" }}>
+              {globalLives != null ? `${globalLives}/${globalMaxLives}` : `— / ${globalMaxLives}`}
+            </Text>
+          </View>
         </View>
       </View>
 
@@ -291,7 +314,7 @@ export default function PackageSubjects() {
           // compute maximum hearts across rounds for hearts preview
           const livesMax = Math.max(1, ...(item.rounds || []).map((r) => Number(r.maxAttempts || 1)));
           // compute current hearts for each round, but for preview we take the max remaining across rounds
-          const remainingArray = (item.rounds || []).map((r) => deriveHearts(r, nowTs).remainingHearts);
+          const remainingArray = (item.rounds || []).map((r) => deriveHearts(r, nowTs, globalRefillMs).remainingHearts);
           const livesNow = remainingArray.length ? Math.max(...remainingArray) : livesMax;
 
           return (
@@ -307,11 +330,9 @@ export default function PackageSubjects() {
                   <Text style={styles.roundCount}>{(item.rounds || []).length} rounds</Text>
 
                   <View style={styles.heartsRow}>
-                    {Array.from({ length: livesMax }).map((_, i) => (
-                      <Text key={i} style={{ fontSize: 15, marginRight: 2, opacity: i < livesNow ? 1 : 0.25 }}>
-                        ❤️
-                      </Text>
-                    ))}
+                    {/* per-subject preview: show single linear heart + number for clarity */}
+                    <Ionicons name={livesNow > 0 ? "heart" : "heart-outline"} size={16} color={livesNow > 0 ? HEART_COLOR : MUTED} />
+                    <Text style={{ marginLeft: 6, fontWeight: "800", color: PRIMARY }}>{livesNow}/{livesMax}</Text>
                   </View>
                 </View>
 
@@ -321,7 +342,7 @@ export default function PackageSubjects() {
               {expanded && (
                 <View style={styles.expandArea}>
                   {(item.rounds || []).map((r) => {
-                    const { remainingHearts, nextHeartInMs, competitive } = deriveHearts(r, nowTs);
+                    const { remainingHearts, nextHeartInMs, competitive } = deriveHearts(r, nowTs, globalRefillMs);
                     const disabled = remainingHearts <= 0;
                     return (
                       <View key={`${r.roundId}_${r.examId}`} style={{ marginBottom: 10 }}>
