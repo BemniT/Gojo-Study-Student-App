@@ -1,3 +1,5 @@
+// app/dashboard/exam.jsx
+// ... (only updated portions shown in full file below)
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import {
   View,
@@ -17,6 +19,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
+import { getStudentLives } from "../lib/livesHelpers"; // new
 
 const { width: SCREEN_W } = Dimensions.get("window");
 const PRIMARY = "#0B72FF";
@@ -93,9 +96,28 @@ export default function ExamScreen() {
   const [packages, setPackages] = useState([]);
   const [studentGrade, setStudentGrade] = useState(null);
 
+  // NEW: global lives (POC read-only)
+  const [studentLives, setStudentLives] = useState(null);
+
   const fetchAll = useCallback(async () => {
     const grade = normalizeGrade(await AsyncStorage.getItem("studentGrade"));
     setStudentGrade(grade || null);
+
+    // load student id to fetch lives
+    const sid =
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      (await AsyncStorage.getItem("username")) ||
+      null;
+
+    if (sid) {
+      try {
+        const lives = await getStudentLives(sid);
+        if (lives) setStudentLives(lives);
+      } catch (e) {
+        // ignore in POC
+      }
+    }
 
     await Promise.all([loadLeaders(grade), loadPackages(grade)]);
   }, []);
@@ -149,7 +171,6 @@ export default function ExamScreen() {
 
   const loadPackages = useCallback(async (grade) => {
     try {
-      // ✅ FIX: your actual DB path
       const pkgSnap = await tryGet([
         `Platform1/companyExams/packages`,
         `companyExams/packages`,
@@ -203,10 +224,25 @@ export default function ExamScreen() {
             <Text style={styles.title}>Exams</Text>
             <Text style={styles.subtitle}>Compete nationally and improve your skills</Text>
           </View>
-          <TouchableOpacity style={styles.leaderBtn} onPress={() => router.push("/exam/leaderboard")}>
-            <Ionicons name="trophy" size={15} color="#fff" />
-            <Text style={styles.leaderBtnText}>Leaderboard</Text>
-          </TouchableOpacity>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+            {/* Lives display (POC read-only) */}
+            {studentLives ? (
+              <View style={{ marginRight: 8, alignItems: "center" }}>
+                <Text style={{ fontWeight: "800", color: PRIMARY }}>Lives</Text>
+                <View style={{ flexDirection: "row", marginTop: 4 }}>
+                  {Array.from({ length: Number(studentLives.maxLives || 5) }).map((_, i) => (
+                    <Text key={i} style={{ marginLeft: 4, opacity: i < Number(studentLives.currentLives || 0) ? 1 : 0.25 }}>
+                      ❤️
+                    </Text>
+                  ))}
+                </View>
+              </View>
+            ) : null}
+            <TouchableOpacity style={styles.leaderBtn} onPress={() => router.push("/exam/leaderboard")}>
+              <Ionicons name="trophy" size={15} color="#fff" />
+              <Text style={styles.leaderBtnText}>Leaderboard</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* SECTION 1: LEADERBOARD */}
@@ -290,7 +326,7 @@ export default function ExamScreen() {
         </View>
       </View>
     ),
-    [leaders, packages, router, studentGrade]
+    [leaders, packages, router, studentGrade, studentLives]
   );
 
   if (loading) {

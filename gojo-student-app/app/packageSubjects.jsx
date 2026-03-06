@@ -27,6 +27,7 @@ const BG = "#FFFFFF";
 const TEXT = "#0B2540";
 const MUTED = "#6B78A8";
 const HEART_REFILL_MS = 20 * 60 * 1000; // 20 minutes
+const DEFAULT_GLOBAL_MAX_LIVES = 5;
 
 async function tryGet(paths) {
   for (const p of paths) {
@@ -60,6 +61,7 @@ function formatTimeLeft(ms) {
  * - remainingHearts and nextHeartInMs are computed on render using nowTs
  *
  * Fix: competitive packages do NOT show refill countdown - they are one-attempt rules.
+ * Also load & show global lives (if available).
  */
 
 export default function PackageSubjects() {
@@ -74,6 +76,10 @@ export default function PackageSubjects() {
   const [subjects, setSubjects] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [packageType, setPackageType] = useState(null); // 'competitive' | 'practice' | etc
+
+  // global lives
+  const [globalLives, setGlobalLives] = useState(null);
+  const [globalMaxLives, setGlobalMaxLives] = useState(DEFAULT_GLOBAL_MAX_LIVES);
 
   // ticking clock for UI timers (does NOT trigger reload)
   const [nowTs, setNowTs] = useState(Date.now());
@@ -109,6 +115,22 @@ export default function PackageSubjects() {
     }
     const pkg = pkgSnap.val() || {};
     setPackageType(pkg.type || null);
+
+    // load global lives state (best-effort)
+    if (sid) {
+      const livesNode = await tryGet([`Platform1/studentLives/${sid}`, `studentLives/${sid}`]);
+      if (livesNode) {
+        const lives = typeof livesNode === "object" ? (livesNode.lives ?? null) : null;
+        const max = typeof livesNode === "object" ? (livesNode.maxLives ?? DEFAULT_GLOBAL_MAX_LIVES) : DEFAULT_GLOBAL_MAX_LIVES;
+        setGlobalLives(Number(lives ?? 0));
+        setGlobalMaxLives(Number(max || DEFAULT_GLOBAL_MAX_LIVES));
+      } else {
+        setGlobalLives(null);
+        setGlobalMaxLives(DEFAULT_GLOBAL_MAX_LIVES);
+      }
+    } else {
+      setGlobalLives(null);
+    }
 
     // if package has grade and it doesn't match student's grade, show empty
     if (grade && pkg.grade && normalizeGrade(pkg.grade) && normalizeGrade(pkg.grade) !== String(grade)) {
@@ -247,6 +269,14 @@ export default function PackageSubjects() {
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>{packageName}</Text>
           <Text style={styles.subtitle}>Choose a subject and start a round</Text>
+        </View>
+
+        {/* Global lives preview */}
+        <View style={{ alignItems: "flex-end" }}>
+          <Text style={{ color: MUTED, fontWeight: "800" }}>Lives</Text>
+          <Text style={{ color: PRIMARY, fontWeight: "900" }}>
+            {globalLives != null ? `${"❤️".repeat(Math.max(0, Math.min(globalLives, 5)))} ${globalLives}` : `— / ${globalMaxLives}`}
+          </Text>
         </View>
       </View>
 

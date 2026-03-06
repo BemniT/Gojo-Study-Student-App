@@ -54,10 +54,9 @@ export default function LoginScreen() {
 
   // Find user by username inside the resolved school's Users node
   const findUserByUsername = async (uname) => {
-    // Get schoolKey using prefix
     const schoolKey = await resolveSchoolKeyFromUsername(uname);
     if (!schoolKey) {
-      return { error: `School code not found for username prefix (${uname.substr(0,3)})` };
+      return { error: `School code not found for username prefix (${uname.substr(0, 3)})` };
     }
 
     try {
@@ -67,7 +66,6 @@ export default function LoginScreen() {
       if (snap.exists()) {
         let found = null;
         snap.forEach((child) => {
-          // child.key is the node key under that school's Users node
           found = { ...child.val(), _nodeKey: child.key, _schoolKey: schoolKey };
           return true;
         });
@@ -84,7 +82,9 @@ export default function LoginScreen() {
   const handleSignIn = async () => {
     setError("");
     const uname = username.trim();
-    if (!uname || !password) {
+    const pwd = String(password ?? "").trim();
+
+    if (!uname || !pwd) {
       setError("Please enter username and password.");
       return;
     }
@@ -107,8 +107,9 @@ export default function LoginScreen() {
         return;
       }
 
-      // password check (NOTE: passwords appear stored plaintext in DB)
-      if (!("password" in user) || user.password !== password) {
+      // Password check: normalize both stored and input to strings to avoid type mismatches (e.g. numeric 1 in DB)
+      const storedPwd = user.password == null ? "" : String(user.password).trim();
+      if (!storedPwd || storedPwd !== pwd) {
         setError("Incorrect password.");
         return;
       }
@@ -118,22 +119,19 @@ export default function LoginScreen() {
         return;
       }
 
-      // If the Users node contains studentId (like GMIS_...), preserve it.
       const studentNodeKey = user.studentId || "";
 
-      // Persist information. Important: we save the school's key so other modules can resolve Users path.
+      // Persist information
       await AsyncStorage.multiSet([
         ["userId", user.userId || ""],
         ["username", user.username || ""],
-        ["userNodeKey", user._nodeKey || ""], // node key under Schools/{schoolKey}/Users
+        ["userNodeKey", user._nodeKey || ""],
         ["studentId", user.studentId || ""],
         ["studentNodeKey", studentNodeKey || ""],
         ["role", user.role || ""],
-        ["schoolKey", user._schoolKey || ""], // new: which school bucket this user belongs to
+        ["schoolKey", user._schoolKey || ""],
       ]);
 
-      // NOTE: other code that currently reads `Users/${userNodeKey}` must be updated to read
-      // `Schools/${schoolKey}/Users/${userNodeKey}` (or use a shared helper).
       router.replace("/dashboard/home");
     } catch (err) {
       console.error("Login error:", err);
@@ -146,7 +144,6 @@ export default function LoginScreen() {
   return (
     <SafeAreaView style={styles.safe} edges={["top", "left", "right", "bottom"]}>
       <StatusBar style="dark" />
-      {/* Dismiss keyboard when tapping outside inputs */}
       <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <KeyboardAvoidingView
           behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -195,20 +192,12 @@ export default function LoginScreen() {
                   returnKeyType="done"
                   onSubmitEditing={handleSignIn}
                 />
-                <TouchableOpacity
-                  activeOpacity={0.7}
-                  onPress={() => setShowPassword((v) => !v)}
-                  style={styles.eyeButton}
-                >
+                <TouchableOpacity activeOpacity={0.7} onPress={() => setShowPassword((v) => !v)} style={styles.eyeButton}>
                   <Ionicons name={showPassword ? "eye" : "eye-off"} size={20} color={MUTED} />
                 </TouchableOpacity>
               </View>
 
-              <TouchableOpacity
-                style={[styles.button, loading && styles.buttonDisabled]}
-                onPress={handleSignIn}
-                disabled={loading}
-              >
+              <TouchableOpacity style={[styles.button, loading && styles.buttonDisabled]} onPress={handleSignIn} disabled={loading}>
                 {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Login</Text>}
               </TouchableOpacity>
 
@@ -232,7 +221,7 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: BACKGROUND },
   scrollContent: { flexGrow: 1, justifyContent: "space-between", paddingTop: 12, paddingBottom: 20 },
   top: { alignItems: "center", marginTop: 8 },
-  logo: { width: 200, height: 200, borderRadius: 14 , marginTop: 16},
+  logo: { width: 200, height: 200, borderRadius: 14, marginTop: 16 },
   title: { marginTop: -12, fontSize: 36, color: "#111", fontWeight: "800" },
   subtitle: { marginTop: 8, fontSize: 14, color: MUTED, textAlign: "center" },
 
