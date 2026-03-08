@@ -1,17 +1,10 @@
 // app/dashboard/exam.jsx
-// ... (only updated portions shown in full file below)
+// Updated: robust student grade resolution (reads Platform1/Schools/*/Students/{studentId} when AsyncStorage missing)
+// Packages and leaderboard now filtered by the resolved grade.
+
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import {
-  View,
-  Text,
-  StyleSheet,
-  SafeAreaView,
-  TouchableOpacity,
-  FlatList,
-  ActivityIndicator,
-  Image,
-  RefreshControl,
-  Dimensions,
+  View, Text, StyleSheet, SafeAreaView, TouchableOpacity, FlatList, ActivityIndicator, Image, RefreshControl, Dimensions
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
@@ -19,7 +12,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
-import { getStudentLives } from "../lib/livesHelpers"; // new
+import { getStudentLives } from "../lib/livesHelpers"; // leave if needed elsewhere
 
 const { width: SCREEN_W } = Dimensions.get("window");
 const PRIMARY = "#0B72FF";
@@ -42,30 +35,88 @@ async function tryGet(paths) {
   return null;
 }
 
+// Normalize a grade string to a canonical form like "12" (no "grade" prefix)
 function normalizeGrade(g) {
   if (!g) return null;
-  return String(g).trim().toLowerCase().replace(/^grade/i, "");
+  const s = String(g).trim().toLowerCase();
+  // If it is "grade12" or "grade 12" -> return "12"
+  const matched = s.match(/(\d{1,2})/);
+  if (matched) return String(matched[1]);
+  return s.replace(/^grade\s*/i, "");
 }
 
-async function resolveSchoolKeyForPrefix(prefix) {
-  const snap = await tryGet([`Platform1/schoolCodeIndex/${prefix}`, `schoolCodeIndex/${prefix}`]);
-  return snap?.val?.() || null;
+// Try to locate student's record under Platform1/Schools/*/Students/{studentId}
+// Returns the student object or null
+async function findStudentRecordUnderSchools(studentId) {
+  if (!studentId) return null;
+  try {
+    const schoolsSnap = await get(ref(database, `Platform1/Schools`));
+    if (!schoolsSnap || !schoolsSnap.exists()) return null;
+    const schools = schoolsSnap.val() || {};
+    // iterate schools and check Students/<studentId>
+    for (const schoolKey of Object.keys(schools)) {
+      try {
+        const studentSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
+        if (studentSnap && studentSnap.exists()) {
+          return { ...studentSnap.val(), _schoolKey: schoolKey };
+        }
+      } catch (e) {
+        // ignore and continue
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+  return null;
 }
-async function queryUserProfile(userId) {
+
+async function resolveStudentGradeFromPlatform(studentId) {
+  // 1) try school-scoped lookup
+  const rec = await findStudentRecordUnderSchools(studentId);
+  if (rec) {
+    // student record structure may have basicStudentInformation.grade or grade
+    const gradeRaw = rec?.basicStudentInformation?.grade ?? rec?.grade ?? rec?.basicStudentInformation?.academicGrade ?? null;
+    const normalized = normalizeGrade(gradeRaw);
+    if (normalized) return normalized;
+  }
+
+  // 2) fallback: also check Platform1/Students/<studentId> (if your DB uses this)
+  try {
+    const snap = await get(ref(database, `Platform1/Students/${studentId}`));
+    if (snap && snap.exists()) {
+      const val = snap.val() || {};
+      const gradeRaw = val?.basicStudentInformation?.grade ?? val?.grade ?? null;
+      const normalized = normalizeGrade(gradeRaw);
+      if (normalized) return normalized;
+    }
+  } catch {}
+
+  // 3) not found
+  return null;
+}
+
+async function resolveSchoolPrefixForUserId(userId) {
+  // attempt to find school code prefix map (used in other helpers)
+  try {
+    const snap = await get(ref(database, `Platform1/schoolCodeIndex`));
+    if (snap && snap.exists()) return snap.val() || {};
+  } catch {}
+  return null;
+}
+
+async function resolveUserProfile(userId) {
   if (!userId) return {};
   try {
     const prefix = String(userId).slice(0, 3).toUpperCase();
-    const schoolKey = await resolveSchoolKeyForPrefix(prefix);
+    const schoolsIndexSnap = await get(ref(database, `Platform1/schoolCodeIndex/${prefix}`));
+    const schoolKey = schoolsIndexSnap?.val?.() || null;
     let profile = null;
 
     if (schoolKey) {
       try {
         const snap = await queryUserByUsernameInSchool(userId, schoolKey);
         if (snap?.exists()) {
-          snap.forEach((c) => {
-            profile = c.val();
-            return true;
-          });
+          snap.forEach((c) => { profile = c.val(); return true; });
         }
       } catch {}
     }
@@ -73,10 +124,7 @@ async function queryUserProfile(userId) {
       try {
         const snap = await queryUserByChildInSchool("username", userId, null);
         if (snap?.exists()) {
-          snap.forEach((c) => {
-            profile = c.val();
-            return true;
-          });
+          snap.forEach((c) => { profile = c.val(); return true; });
         }
       } catch {}
     }
@@ -96,30 +144,39 @@ export default function ExamScreen() {
   const [packages, setPackages] = useState([]);
   const [studentGrade, setStudentGrade] = useState(null);
 
-  // NEW: global lives (POC read-only)
-  const [studentLives, setStudentLives] = useState(null);
-
   const fetchAll = useCallback(async () => {
-    const grade = normalizeGrade(await AsyncStorage.getItem("studentGrade"));
-    setStudentGrade(grade || null);
+    setLoading(true);
 
-    // load student id to fetch lives
+    // 1) attempt to read cached studentGrade from AsyncStorage
+    let gradeRaw = await AsyncStorage.getItem("studentGrade");
+    let grade = normalizeGrade(gradeRaw);
+
+    // 2) resolve studentId and attempt to derive grade from platform if AsyncStorage missing or invalid
     const sid =
       (await AsyncStorage.getItem("studentNodeKey")) ||
       (await AsyncStorage.getItem("studentId")) ||
       (await AsyncStorage.getItem("username")) ||
       null;
 
-    if (sid) {
+    if ((!grade || grade === "") && sid) {
       try {
-        const lives = await getStudentLives(sid);
-        if (lives) setStudentLives(lives);
+        const derived = await resolveStudentGradeFromPlatform(sid);
+        if (derived) {
+          grade = derived;
+          // cache it for subsequent loads
+          try { await AsyncStorage.setItem("studentGrade", `grade${derived}`); } catch (e) { /* ignore */ }
+        }
       } catch (e) {
-        // ignore in POC
+        // ignore
       }
     }
 
+    // final normalization (string numeric like "12")
+    setStudentGrade(grade || null);
+
+    // load leaders & packages using derived grade
     await Promise.all([loadLeaders(grade), loadPackages(grade)]);
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -140,6 +197,8 @@ export default function ExamScreen() {
     try {
       const countrySnap = await tryGet([`Platform1/country`, `country`]);
       const country = countrySnap?.val?.() || "Ethiopia";
+
+      // grade should be numeric string like "12" or null
       const gradeKey = grade ? `grade${grade}` : "grade9";
 
       const snap = await tryGet([
@@ -159,23 +218,20 @@ export default function ExamScreen() {
 
       const enriched = await Promise.all(
         top.map(async (entry) => {
-          const u = await queryUserProfile(entry.userId);
+          const u = await resolveUserProfile(entry.userId);
           return { ...entry, profile: u.profile || null };
         })
       );
       setLeaders(enriched);
-    } catch {
+    } catch (e) {
+      console.warn("loadLeaders error", e);
       setLeaders([]);
     }
   }, []);
 
   const loadPackages = useCallback(async (grade) => {
     try {
-      const pkgSnap = await tryGet([
-        `Platform1/companyExams/packages`,
-        `companyExams/packages`,
-      ]);
-
+      const pkgSnap = await tryGet([`Platform1/companyExams/packages`, `companyExams/packages`]);
       if (!pkgSnap?.exists()) {
         setPackages([]);
         return;
@@ -184,12 +240,12 @@ export default function ExamScreen() {
       const arr = [];
       pkgSnap.forEach((c) => {
         const v = c.val() || {};
-        const pkgGrade = normalizeGrade(v.grade);
-        if (grade && pkgGrade && pkgGrade !== String(grade)) return; // filter by student grade
-
+        const pkgGrade = normalizeGrade(v.grade); // normalizes to "7", "12", etc.
+        // If student's grade is known, filter strictly by grade
+        if (grade && pkgGrade && pkgGrade !== String(grade)) return;
+        // else include package if active
         const subjectsNode = v.subjects || {};
         const subjectCount = Object.keys(subjectsNode).length;
-
         arr.push({
           id: c.key,
           name: v.name || c.key,
@@ -225,19 +281,6 @@ export default function ExamScreen() {
             <Text style={styles.subtitle}>Compete nationally and improve your skills</Text>
           </View>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-            {/* Lives display (POC read-only) */}
-            {studentLives ? (
-              <View style={{ marginRight: 8, alignItems: "center" }}>
-                <Text style={{ fontWeight: "800", color: PRIMARY }}>Lives</Text>
-                <View style={{ flexDirection: "row", marginTop: 4 }}>
-                  {Array.from({ length: Number(studentLives.maxLives || 5) }).map((_, i) => (
-                    <Text key={i} style={{ marginLeft: 4, opacity: i < Number(studentLives.currentLives || 0) ? 1 : 0.25 }}>
-                      ❤️
-                    </Text>
-                  ))}
-                </View>
-              </View>
-            ) : null}
             <TouchableOpacity style={styles.leaderBtn} onPress={() => router.push("/exam/leaderboard")}>
               <Ionicons name="trophy" size={15} color="#fff" />
               <Text style={styles.leaderBtnText}>Leaderboard</Text>
@@ -326,7 +369,7 @@ export default function ExamScreen() {
         </View>
       </View>
     ),
-    [leaders, packages, router, studentGrade, studentLives]
+    [leaders, packages, router, studentGrade]
   );
 
   if (loading) {

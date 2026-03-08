@@ -79,6 +79,16 @@ export default function LoginScreen() {
     }
   };
 
+  // Helper: normalize grade value to "grade12" when storing
+  function normalizeAndFormatGrade(val) {
+    if (val == null) return null;
+    const s = String(val).trim().toLowerCase();
+    const m = s.match(/(\d{1,2})/);
+    if (m) return `grade${m[1]}`;
+    // fallback to use raw
+    return `grade${s.replace(/\D/g, "") || s}`;
+  }
+
   const handleSignIn = async () => {
     setError("");
     const uname = username.trim();
@@ -121,8 +131,24 @@ export default function LoginScreen() {
 
       const studentNodeKey = user.studentId || "";
 
-      // Persist information
-      await AsyncStorage.multiSet([
+      // Try to read student's grade from Platform1/Schools/{schoolKey}/Students/{studentId}
+      let studentGradeFormatted = null;
+      try {
+        if (user._schoolKey && studentNodeKey) {
+          const studSnap = await get(ref(database, `Platform1/Schools/${user._schoolKey}/Students/${studentNodeKey}`));
+          if (studSnap && studSnap.exists()) {
+            const studVal = studSnap.val() || {};
+            const gradeRaw = studVal?.basicStudentInformation?.grade ?? studVal?.grade ?? null;
+            const normalized = normalizeAndFormatGrade(gradeRaw);
+            if (normalized) studentGradeFormatted = normalized;
+          }
+        }
+      } catch (e) {
+        console.warn("[Login] could not read student record for grade:", e);
+      }
+
+      // Persist information (overwrite any previous cached studentGrade)
+      const items = [
         ["userId", user.userId || ""],
         ["username", user.username || ""],
         ["userNodeKey", user._nodeKey || ""],
@@ -130,7 +156,10 @@ export default function LoginScreen() {
         ["studentNodeKey", studentNodeKey || ""],
         ["role", user.role || ""],
         ["schoolKey", user._schoolKey || ""],
-      ]);
+      ];
+      if (studentGradeFormatted) items.push(["studentGrade", studentGradeFormatted]);
+
+      await AsyncStorage.multiSet(items);
 
       router.replace("/dashboard/home");
     } catch (err) {

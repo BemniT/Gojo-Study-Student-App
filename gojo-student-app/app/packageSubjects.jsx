@@ -11,6 +11,8 @@ import {
   UIManager,
   Platform,
   StatusBar,
+  Modal,
+  Animated,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -53,17 +55,12 @@ function formatTimeLeft(ms) {
   const ss = Math.floor(sec % 60).toString().padStart(2, "0");
   return `${mm}:${ss}`;
 }
-
-/**
- * PackageSubjects
- *
- * - load() runs only when packageId or incomingGrade changes
- * - nowTs is updated every second to drive UI timers only
- * - remainingHearts and nextHeartInMs are computed on render using nowTs and refillMs
- *
- * Competitive packages: no refill
- * Global lives: shown only here (header) as a single heart icon + numeric counter
- */
+function formatMsToMMSS(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const mm = Math.floor(s / 60).toString().padStart(2, "0");
+  const ss = Math.floor(s % 60).toString().padStart(2, "0");
+  return `${mm}:${ss}`;
+}
 
 export default function PackageSubjects() {
   const router = useRouter();
@@ -82,6 +79,12 @@ export default function PackageSubjects() {
   const [globalLives, setGlobalLives] = useState(null);
   const [globalMaxLives, setGlobalMaxLives] = useState(DEFAULT_GLOBAL_MAX_LIVES);
   const [globalRefillMs, setGlobalRefillMs] = useState(HEART_REFILL_MS);
+  const [globalLastConsumedAt, setGlobalLastConsumedAt] = useState(null);
+
+  // heart info modal
+  const [showHeartInfoModal, setShowHeartInfoModal] = useState(false);
+  const heartModalAnim = useRef(new Animated.Value(0)).current;
+  const [nextHeartInMs, setNextHeartInMs] = useState(0);
 
   // ticking clock for UI timers (does NOT trigger reload)
   const [nowTs, setNowTs] = useState(Date.now());
@@ -126,7 +129,6 @@ export default function PackageSubjects() {
         const raw = typeof livesNode.val === "function" ? livesNode.val() : livesNode;
         const lives = Number(raw?.currentLives ?? raw?.lives ?? null);
         const max = Number(raw?.maxLives ?? DEFAULT_GLOBAL_MAX_LIVES);
-        // refillIntervalMs may be presented in seconds or ms; normalize:
         let refillRaw = raw?.refillIntervalMs ?? raw?.refillInterval ?? null;
         let refillMs = HEART_REFILL_MS;
         if (refillRaw != null) {
@@ -134,18 +136,22 @@ export default function PackageSubjects() {
           if (!Number.isFinite(num)) refillMs = HEART_REFILL_MS;
           else refillMs = num > 1000 ? num : num * 1000;
         }
+        const last = Number(raw?.lastConsumedAt ?? raw?.lastConsumed ?? 0) || null;
         setGlobalLives(Number.isFinite(lives) ? lives : null);
         setGlobalMaxLives(Number.isFinite(max) ? max : DEFAULT_GLOBAL_MAX_LIVES);
         setGlobalRefillMs(refillMs);
+        setGlobalLastConsumedAt(last);
       } else {
         setGlobalLives(null);
         setGlobalMaxLives(DEFAULT_GLOBAL_MAX_LIVES);
         setGlobalRefillMs(HEART_REFILL_MS);
+        setGlobalLastConsumedAt(null);
       }
     } else {
       setGlobalLives(null);
       setGlobalMaxLives(DEFAULT_GLOBAL_MAX_LIVES);
       setGlobalRefillMs(HEART_REFILL_MS);
+      setGlobalLastConsumedAt(null);
     }
 
     // if package has grade and it doesn't match student's grade, show empty
@@ -228,7 +234,6 @@ export default function PackageSubjects() {
   };
 
   // derive hearts & next-heart countdown for a round (pure function)
-  // If refillMs is provided it is used; otherwise fallback to HEART_REFILL_MS
   function deriveHearts(round, now = Date.now(), refillMs = HEART_REFILL_MS) {
     const maxAttempts = Number(round.maxAttempts || 1);
     const used = Number(round.attemptsUsedRaw || 0);
@@ -240,13 +245,10 @@ export default function PackageSubjects() {
       return { remainingHearts, nextHeartInMs: 0, competitive: true };
     }
 
-    // Non-competitive: apply refill logic
     if (!lastTs || used <= 0) {
-      // no previous attempts or zero used => all hearts available
       return { remainingHearts: Math.max(0, maxAttempts - used), nextHeartInMs: 0, competitive: false };
     }
 
-    // how many refill cycles since last attempt
     const recovered = Math.floor((now - lastTs) / refillMs);
     const effectiveUsed = Math.max(0, used - recovered);
     const remainingHearts = Math.max(0, maxAttempts - effectiveUsed);
@@ -254,12 +256,42 @@ export default function PackageSubjects() {
     let nextHeartInMs = 0;
     if (remainingHearts < maxAttempts) {
       const elapsedSinceLast = now - lastTs;
-      // next refill occurs at refillMs - (elapsedSinceLast % refillMs)
       nextHeartInMs = refillMs - (elapsedSinceLast % refillMs);
     }
 
     return { remainingHearts, nextHeartInMs, competitive: false };
   }
+
+  // heart modal animation & countdown
+  useEffect(() => {
+    if (showHeartInfoModal) {
+      Animated.spring(heartModalAnim, { toValue: 1, useNativeDriver: true }).start();
+    } else {
+      Animated.timing(heartModalAnim, { toValue: 0, duration: 160, useNativeDriver: true }).start();
+    }
+  }, [showHeartInfoModal]);
+
+  useEffect(() => {
+    let timer;
+    function recompute() {
+      if (!globalLastConsumedAt || !globalRefillMs) {
+        setNextHeartInMs(globalRefillMs || HEART_REFILL_MS);
+        return;
+      }
+      const now = Date.now();
+      const elapsed = now - Number(globalLastConsumedAt || 0);
+      if (elapsed < 0) {
+        setNextHeartInMs(globalRefillMs);
+        return;
+      }
+      const remainder = elapsed % globalRefillMs;
+      const next = Math.max(0, globalRefillMs - remainder);
+      setNextHeartInMs(next);
+    }
+    recompute();
+    if (showHeartInfoModal) timer = setInterval(recompute, 1000);
+    return () => clearInterval(timer);
+  }, [globalLastConsumedAt, globalRefillMs, showHeartInfoModal]);
 
   if (loading) {
     return (
@@ -288,8 +320,8 @@ export default function PackageSubjects() {
           <Text style={styles.subtitle}>Choose a subject and start a round</Text>
         </View>
 
-        {/* Global lives preview: single linear heart + number */}
-        <View style={{ alignItems: "flex-end", minWidth: 60 }}>
+        {/* Global lives preview: single linear heart + number (tappable) */}
+        <TouchableOpacity onPress={() => setShowHeartInfoModal(true)} style={{ alignItems: "flex-end", minWidth: 60 }}>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <Ionicons
               name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"}
@@ -297,10 +329,10 @@ export default function PackageSubjects() {
               color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED}
             />
             <Text style={{ marginLeft: 6, color: PRIMARY, fontWeight: "900" }}>
-              {globalLives != null ? `${globalLives}/${globalMaxLives}` : `— / ${globalMaxLives}`}
+              {globalLives != null ? `${globalLives}` : `—`}
             </Text>
           </View>
-        </View>
+        </TouchableOpacity>
       </View>
 
       <FlatList
@@ -330,9 +362,8 @@ export default function PackageSubjects() {
                   <Text style={styles.roundCount}>{(item.rounds || []).length} rounds</Text>
 
                   <View style={styles.heartsRow}>
-                    {/* per-subject preview: show single linear heart + number for clarity */}
                     <Ionicons name={livesNow > 0 ? "heart" : "heart-outline"} size={16} color={livesNow > 0 ? HEART_COLOR : MUTED} />
-                    <Text style={{ marginLeft: 6, fontWeight: "800", color: PRIMARY }}>{livesNow}/{livesMax}</Text>
+                    <Text style={{ marginLeft: 6, fontWeight: "800", color: PRIMARY }}>{livesNow}</Text>
                   </View>
                 </View>
 
@@ -375,7 +406,6 @@ export default function PackageSubjects() {
 
                         {disabled ? (
                           <View style={{ marginTop: 4, marginLeft: 2 }}>
-                            {/* Different messaging for competitive vs practice */}
                             {competitive ? (
                               <Text style={styles.noHeartText}>No attempts left — this is a competitive round (no refills)</Text>
                             ) : (
@@ -396,6 +426,24 @@ export default function PackageSubjects() {
           );
         }}
       />
+
+      {/* Heart Info Modal */}
+      <Modal visible={showHeartInfoModal} transparent animationType="none" onRequestClose={() => setShowHeartInfoModal(false)}>
+        <View style={modalStyles.overlay}>
+          <Animated.View style={[modalStyles.card, { transform: [{ scale: heartModalAnim.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1] }) }], opacity: heartModalAnim }]}>
+            <Text style={modalStyles.title}>Lives & refill</Text>
+            <Text style={modalStyles.text}>Hearts are global. If you fail the exam (or use hearts), they are deducted and refill automatically over time.</Text>
+            <View style={{ marginTop: 12, alignItems: "center" }}>
+              <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={32} color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED} />
+              <Text style={{ fontWeight: "900", marginTop: 8, fontSize: 18 }}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
+              <Text style={{ marginTop: 8, color: MUTED }}>Next life in: {formatMsToMMSS(nextHeartInMs)}</Text>
+            </View>
+            <TouchableOpacity style={modalStyles.closeBtnPrimary} onPress={() => setShowHeartInfoModal(false)}>
+              <Text style={modalStyles.closeBtnTextPrimary}>Close</Text>
+            </TouchableOpacity>
+          </Animated.View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -480,4 +528,26 @@ const styles = StyleSheet.create({
 
   noHeartText: { color: "#B54708", fontWeight: "700", fontSize: 12 },
   refillText: { marginTop: 2, color: MUTED, fontSize: 12, fontWeight: "700" },
+});
+
+const modalStyles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+  },
+  card: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: "#fff",
+    borderRadius: 14,
+    padding: 18,
+    alignItems: "center",
+  },
+  title: { fontSize: 20, fontWeight: "900", marginBottom: 8, color: TEXT },
+  text: { color: MUTED, textAlign: "center" },
+  closeBtnPrimary: { marginTop: 18, backgroundColor: PRIMARY, paddingVertical: 10, borderRadius: 10, alignItems: "center", width: "100%" },
+  closeBtnTextPrimary: { color: "#fff", fontWeight: "900" },
 });
