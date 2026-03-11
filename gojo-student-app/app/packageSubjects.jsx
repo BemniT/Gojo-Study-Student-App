@@ -102,6 +102,13 @@ export default function PackageSubjects() {
   const heartModalAnim = useRef(new Animated.Value(0)).current;
   const [nextHeartInMs, setNextHeartInMs] = useState(0);
 
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [showNotifModal, setShowNotifModal] = useState(false);
+  const [showRead, setShowRead] = useState(false);
+  const [lastSeenNotificationsAt, setLastSeenNotificationsAt] = useState(0);
+  const [whatsNew, setWhatsNew] = useState([]);
+
   const [appExamConfig, setAppExamConfig] = useState({
     lives: {
       defaultMaxLives: DEFAULT_GLOBAL_MAX_LIVES,
@@ -118,6 +125,141 @@ export default function PackageSubjects() {
   useEffect(() => {
     const t = setInterval(() => setNowTs(Date.now()), 1000);
     return () => clearInterval(t);
+  }, []);
+
+  const notifVisual = useCallback((type) => {
+    const t = String(type || "").toLowerCase();
+    if (t === "new_package") return { icon: "cube-outline", color: "#2563EB", bg: "#EFF6FF" };
+    if (t === "new_round") return { icon: "layers-outline", color: "#7C3AED", bg: "#F5F3FF" };
+    if (t === "round_live") return { icon: "flash-outline", color: "#EA580C", bg: "#FFF7ED" };
+    if (t === "result_released") return { icon: "trophy-outline", color: "#16A34A", bg: "#ECFDF5" };
+    return { icon: "notifications-outline", color: "#0B72FF", bg: "#EEF4FF" };
+  }, []);
+
+  const parseDeepLink = useCallback((dl) => {
+    const deep = String(dl || "");
+    if (!deep) return null;
+    const [pathname, query] = deep.split("?");
+    const p = {};
+    if (query) {
+      query.split("&").forEach((pair) => {
+        const [k, v] = pair.split("=");
+        if (k) p[decodeURIComponent(k)] = decodeURIComponent(v || "");
+      });
+    }
+    return { pathname: pathname || "/", params: p };
+  }, []);
+
+  const getStudentIdentity = useCallback(async () => {
+    const sid =
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      (await AsyncStorage.getItem("username")) ||
+      null;
+
+    if (!sid) return { sid: null, gradeKey: null };
+
+    const fromStorage =
+      (await AsyncStorage.getItem("studentGrade")) ||
+      (await AsyncStorage.getItem("grade")) ||
+      "";
+    const normalized = String(fromStorage).toLowerCase().replace("grade", "").trim();
+    if (normalized) return { sid, gradeKey: `grade${normalized}` };
+
+    const schoolCode = await getValue([`Platform1/schoolCodeIndex/${String(sid).slice(0, 3)}`]);
+    const student = schoolCode ? await getValue([`Platform1/Schools/${schoolCode}/Students/${sid}`]) : null;
+    const rawGrade = String(student?.basicStudentInformation?.grade || student?.grade || "").trim();
+    return { sid, gradeKey: rawGrade ? `grade${rawGrade}` : null };
+  }, []);
+
+  const loadNotifications = useCallback(async () => {
+    const { sid, gradeKey } = await getStudentIdentity();
+    if (!sid || !gradeKey) return;
+
+    const userMeta = await getValue([`Platform1/usersMeta/${sid}`, `usersMeta/${sid}`]) || {};
+    const lastSeen = Number(userMeta?.lastSeenNotificationsAt || 0);
+    setLastSeenNotificationsAt(lastSeen);
+
+    const node = await getValue([`Platform1/examNotifications`, `examNotifications`]) || {};
+    const arr = Object.keys(node)
+      .map((k) => ({ id: k, ...node[k] }))
+      .filter((n) => !!n?.grades?.[gradeKey])
+      .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+
+    setNotifications(arr);
+    setUnreadCount(arr.filter((n) => Number(n.createdAt || 0) > lastSeen).length);
+  }, [getStudentIdentity]);
+
+  const openNotification = useCallback(async (item) => {
+    const { sid } = await getStudentIdentity();
+    if (sid) {
+      const ts = Math.max(Date.now(), Number(item?.createdAt || 0));
+      await safeUpdate({
+        [`Platform1/usersMeta/${sid}/lastSeenNotificationsAt`]: ts,
+      }).catch(() => {});
+      await loadNotifications();
+    }
+
+    setShowNotifModal(false);
+
+    if (item?.meta?.roundId && item?.meta?.examId) {
+      router.push({
+        pathname: "/examCenter",
+        params: {
+          roundId: item.meta.roundId,
+          examId: item.meta.examId,
+          questionBankId: item.meta.questionBankId || "",
+          mode: "start",
+        },
+      });
+      return;
+    }
+
+    const parsed = parseDeepLink(item?.deepLink);
+    if (parsed) router.push({ pathname: parsed.pathname, params: parsed.params });
+  }, [getStudentIdentity, loadNotifications, parseDeepLink, router]);
+
+  const markAllSeen = useCallback(async () => {
+    const { sid } = await getStudentIdentity();
+    if (!sid) return;
+    await safeUpdate({
+      [`Platform1/usersMeta/${sid}/lastSeenNotificationsAt`]: Date.now(),
+    }).catch(() => {});
+    await loadNotifications();
+  }, [getStudentIdentity, loadNotifications]);
+
+  const buildWhatsNew = useCallback((subjectList) => {
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
+    const items = [];
+
+    for (const s of subjectList || []) {
+      for (const r of s.rounds || []) {
+        const st = Number(r.startTimestamp || 0) * 1000;
+        const rr = Number(r.resultReleaseTimestamp || 0) * 1000;
+
+        if (st && now >= st && now - st <= 3 * DAY) {
+          items.push({
+            type: "round_live",
+            id: `${s.id}_${r.id}_live`,
+            title: `${s.name}: ${r.name}`,
+            subtitle: "Round is now live",
+            round: r,
+          });
+        }
+        if (rr && now >= rr && now - rr <= 3 * DAY) {
+          items.push({
+            type: "result_released",
+            id: `${s.id}_${r.id}_result`,
+            title: `${s.name}: ${r.name}`,
+            subtitle: "Result released",
+            round: r,
+          });
+        }
+      }
+    }
+
+    setWhatsNew(items.slice(0, 8));
   }, []);
 
   const load = useCallback(async () => {
@@ -233,6 +375,9 @@ export default function PackageSubjects() {
           attemptsUsedRaw: Number(progressRaw?.attemptsUsed || 0),
           lastAttemptTsRaw: toMsTs(progressRaw?.lastAttemptTimestamp || progressRaw?.lastSubmittedAt || 0),
           status: r.status || "upcoming",
+          startTimestamp: Number(r.startTimestamp || 0),
+          endTimestamp: Number(r.endTimestamp || 0),
+          resultReleaseTimestamp: Number(r.resultReleaseTimestamp || 0),
         });
       }
 
@@ -246,8 +391,10 @@ export default function PackageSubjects() {
     }
 
     setSubjects(out);
+    buildWhatsNew(out);
+    await loadNotifications();
     setLoading(false);
-  }, [packageId, incomingGrade]);
+  }, [packageId, incomingGrade, buildWhatsNew, loadNotifications]);
 
   useEffect(() => {
     load();
@@ -360,7 +507,6 @@ export default function PackageSubjects() {
     }).catch(() => {});
   }, [deriveAttemptState]);
 
-  // ADD effect to run refill persistence periodically:
   useEffect(() => {
     let timer;
     (async () => {
@@ -380,11 +526,15 @@ export default function PackageSubjects() {
       }
 
       await tick();
-      timer = setInterval(tick, 5000); // every 5s enough
+      timer = setInterval(tick, 5000);
     })();
 
     return () => clearInterval(timer);
   }, [subjects, packageType, applyAttemptRefillIfNeeded]);
+
+  const displayedNotifications = showRead
+    ? notifications
+    : notifications.filter((n) => Number(n.createdAt || 0) > lastSeenNotificationsAt);
 
   if (loading) {
     return (
@@ -405,6 +555,17 @@ export default function PackageSubjects() {
           <Text style={styles.subtitle}>Choose a subject and start a round</Text>
         </View>
 
+        <TouchableOpacity onPress={() => setShowNotifModal(true)} style={{ marginRight: 10 }}>
+          <View>
+            <Ionicons name="notifications-outline" size={22} color={TEXT} />
+            {unreadCount > 0 ? (
+              <View style={styles.badge}>
+                <Text style={styles.badgeTxt}>{unreadCount > 99 ? "99+" : unreadCount}</Text>
+              </View>
+            ) : null}
+          </View>
+        </TouchableOpacity>
+
         <TouchableOpacity onPress={() => setShowHeartInfoModal(true)} style={{ alignItems: "flex-end", minWidth: 72 }}>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <Ionicons
@@ -418,6 +579,33 @@ export default function PackageSubjects() {
           </View>
         </TouchableOpacity>
       </View>
+
+      {whatsNew.length > 0 ? (
+        <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
+          <Text style={{ fontWeight: "900", color: TEXT, marginBottom: 8 }}>What’s New</Text>
+          <FlatList
+            horizontal
+            data={whatsNew}
+            keyExtractor={(i) => i.id}
+            showsHorizontalScrollIndicator={false}
+            ItemSeparatorComponent={() => <View style={{ width: 8 }} />}
+            renderItem={({ item }) => {
+              const v = notifVisual(item.type);
+              return (
+                <View style={styles.newCard}>
+                  <View style={{ flexDirection: "row", alignItems: "center" }}>
+                    <View style={[styles.newIconWrap, { backgroundColor: v.bg }]}>
+                      <Ionicons name={v.icon} size={14} color={v.color} />
+                    </View>
+                    <Text style={styles.newTitle} numberOfLines={1}>{item.title}</Text>
+                  </View>
+                  <Text style={styles.newSub}>{item.subtitle}</Text>
+                </View>
+              );
+            }}
+          />
+        </View>
+      ) : null}
 
       <FlatList
         data={subjects}
@@ -510,6 +698,53 @@ export default function PackageSubjects() {
         }}
       />
 
+      <Modal visible={showNotifModal} transparent animationType="slide" onRequestClose={() => setShowNotifModal(false)}>
+        <View style={modalStyles.overlay}>
+          <View style={[modalStyles.card, { maxHeight: "75%", alignItems: "stretch" }]}>
+            <View style={styles.notifHeaderRow}>
+              <Text style={modalStyles.title}>Notifications</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <TouchableOpacity style={styles.filterBtn} onPress={() => setShowRead((p) => !p)}>
+                  <Text style={styles.filterBtnTxt}>{showRead ? "Unread" : "All"}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.filterBtn} onPress={markAllSeen}>
+                  <Text style={styles.filterBtnTxt}>Mark seen</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <FlatList
+              data={displayedNotifications}
+              keyExtractor={(n) => n.id}
+              ListEmptyComponent={<Text style={{ color: MUTED, textAlign: "center", marginTop: 20 }}>No notifications</Text>}
+              renderItem={({ item }) => {
+                const v = notifVisual(item.type);
+                const isUnread = Number(item.createdAt || 0) > lastSeenNotificationsAt;
+
+                return (
+                  <TouchableOpacity style={[styles.notifItemModern, isUnread ? styles.notifUnread : styles.notifRead]} onPress={() => openNotification(item)}>
+                    <View style={[styles.notifIconWrap, { backgroundColor: v.bg }]}>
+                      <Ionicons name={v.icon} size={18} color={v.color} />
+                    </View>
+
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.notifTitle}>{item.title}</Text>
+                      <Text style={styles.notifBody} numberOfLines={2}>{item.body}</Text>
+                    </View>
+
+                    {isUnread ? <View style={styles.unreadDot} /> : null}
+                  </TouchableOpacity>
+                );
+              }}
+            />
+
+            <TouchableOpacity style={modalStyles.closeBtnPrimary} onPress={() => setShowNotifModal(false)}>
+              <Text style={modalStyles.closeBtnTextPrimary}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={showHeartInfoModal} transparent animationType="none" onRequestClose={() => setShowHeartInfoModal(false)}>
         <View style={modalStyles.overlay}>
           <Animated.View style={[modalStyles.card, { transform: [{ scale: heartModalAnim.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1] }) }], opacity: heartModalAnim }]}>
@@ -557,6 +792,39 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 21, fontWeight: "900", color: TEXT },
   subtitle: { marginTop: 2, color: MUTED, fontSize: 12 },
+
+  badge: {
+    position: "absolute",
+    top: -6,
+    right: -8,
+    backgroundColor: "#EF4444",
+    borderRadius: 10,
+    minWidth: 18,
+    height: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 4,
+  },
+  badgeTxt: { color: "#fff", fontSize: 10, fontWeight: "900" },
+
+  newCard: {
+    width: 230,
+    backgroundColor: "#F8FAFF",
+    borderWidth: 1,
+    borderColor: "#EAF0FF",
+    borderRadius: 12,
+    padding: 10,
+  },
+  newIconWrap: {
+    width: 22,
+    height: 22,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 6,
+  },
+  newTitle: { color: TEXT, fontWeight: "800", fontSize: 12, flex: 1 },
+  newSub: { color: MUTED, marginTop: 6, fontSize: 11 },
 
   subjectCard: {
     backgroundColor: "#fff",
@@ -621,6 +889,55 @@ const styles = StyleSheet.create({
   },
   noHeartText: { color: "#B54708", fontWeight: "800", fontSize: 12 },
   refillText: { marginTop: 2, color: MUTED, fontSize: 12, fontWeight: "700" },
+
+  notifHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  filterBtn: {
+    borderWidth: 1,
+    borderColor: "#EAF0FF",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    backgroundColor: "#F8FAFF",
+  },
+  filterBtnTxt: { color: TEXT, fontWeight: "800", fontSize: 12 },
+
+  notifItemModern: {
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 8,
+    borderWidth: 1,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  notifUnread: {
+    borderColor: "#BFDBFE",
+    backgroundColor: "#F8FBFF",
+  },
+  notifRead: {
+    borderColor: "#E5E7EB",
+    backgroundColor: "#FAFAFA",
+  },
+  notifIconWrap: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  unreadDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#2563EB",
+    marginLeft: 8,
+  },
+  notifTitle: { color: TEXT, fontWeight: "800", fontSize: 13 },
+  notifBody: { color: MUTED, marginTop: 4, fontSize: 12 },
 });
 
 const modalStyles = StyleSheet.create({
