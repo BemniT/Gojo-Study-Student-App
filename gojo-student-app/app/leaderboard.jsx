@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -13,6 +13,8 @@ import {
   Platform,
   StatusBar,
   Modal,
+  Animated,
+  Easing,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
@@ -102,7 +104,81 @@ async function resolveStudentAndSchoolDetails(userId, fallbackSchoolCode) {
     return { student: null, schoolInfo: null };
   }
 }
+function PodiumItem({ item, place, rankColor, animatedStyle }) {
+  const isFirst = place === 1;
+  const medalColor = rankColor(place);
 
+  if (!item) {
+    return (
+      <Animated.View style={[styles.podiumCol, isFirst ? styles.podiumCenter : null, animatedStyle]}>
+        <View
+          style={[
+            styles.podiumAvatarWrap,
+            isFirst ? styles.podiumAvatarWrapFirst : null,
+            styles.emptyPodiumAvatarWrap,
+            { borderColor: medalColor },
+          ]}
+        >
+          <Ionicons name="person-outline" size={isFirst ? 28 : 24} color={medalColor} />
+          <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
+            <Text style={styles.medalText}>{place}</Text>
+          </View>
+        </View>
+
+        <Text numberOfLines={1} style={styles.podiumNameEmpty}>
+          Open Spot
+        </Text>
+        <Text style={styles.podiumPtsEmpty}>Not taken yet</Text>
+
+        <View
+          style={[
+            styles.podiumBlock,
+            isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide,
+            { backgroundColor: `${medalColor}22` },
+          ]}
+        >
+          <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
+        </View>
+      </Animated.View>
+    );
+  }
+
+  return (
+    <Animated.View style={[styles.podiumCol, isFirst ? styles.podiumCenter : null, animatedStyle]}>
+      <View
+        style={[
+          styles.podiumAvatarWrap,
+          isFirst ? styles.podiumAvatarWrapFirst : null,
+          { borderColor: medalColor },
+        ]}
+      >
+        {item.avatar ? (
+          <Image source={{ uri: item.avatar }} style={styles.podiumAvatar} />
+        ) : (
+          <View style={styles.podiumAvatarFallback}>
+            <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+          </View>
+        )}
+        <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
+          <Text style={styles.medalText}>{place}</Text>
+        </View>
+      </View>
+
+      <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
+      <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
+
+      <View
+        style={[
+          styles.podiumBlock,
+          isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide,
+          { backgroundColor: `${medalColor}33` },
+        ]}
+      >
+        <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
+      </View>
+    </Animated.View>
+  );
+}
 export default function LeaderboardScreen() {
   const router = useRouter();
 
@@ -112,9 +188,8 @@ export default function LeaderboardScreen() {
   const [country, setCountry] = useState("Ethiopia");
   const [schoolCode, setSchoolCode] = useState(null);
   const [grade, setGrade] = useState("7");
-  const [scope, setScope] = useState("country"); // country | school
+  const [scope, setScope] = useState("country");
 
-  // cache both leaderboards once, switch instantly
   const [countryRows, setCountryRows] = useState([]);
   const [schoolRows, setSchoolRows] = useState([]);
 
@@ -126,6 +201,10 @@ export default function LeaderboardScreen() {
   const [selectedProfile, setSelectedProfile] = useState(null);
 
   const safeTop = Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0;
+
+  const firstAnim = useRef(new Animated.Value(0)).current;
+  const secondAnim = useRef(new Animated.Value(0)).current;
+  const thirdAnim = useRef(new Animated.Value(0)).current;
 
   const enrichRows = useCallback(async (valObj) => {
     const base = Object.keys(valObj || {}).map((uid) => ({
@@ -205,7 +284,10 @@ export default function LeaderboardScreen() {
     setRefreshing(false);
   }, [load]);
 
-  const rows = useMemo(() => (scope === "school" ? schoolRows : countryRows), [scope, schoolRows, countryRows]);
+  const rows = useMemo(
+    () => (scope === "school" ? schoolRows : countryRows),
+    [scope, schoolRows, countryRows]
+  );
 
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -226,7 +308,93 @@ export default function LeaderboardScreen() {
     return { first, second, third };
   }, [top3]);
 
-  const rankColor = (rank) => rank === 1 ? C.gold : rank === 2 ? C.silver : rank === 3 ? C.bronze : C.primary;
+  const hasPodium = !!(podium.first || podium.second || podium.third);
+
+  useEffect(() => {
+    firstAnim.setValue(0);
+    secondAnim.setValue(0);
+    thirdAnim.setValue(0);
+
+    if (!hasPodium) return;
+
+    Animated.stagger(120, [
+      Animated.timing(secondAnim, {
+        toValue: 1,
+        duration: 500,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(firstAnim, {
+        toValue: 1,
+        duration: 580,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(thirdAnim, {
+        toValue: 1,
+        duration: 500,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [hasPodium, firstAnim, secondAnim, thirdAnim, scope]);
+
+  const firstAnimatedStyle = {
+    opacity: firstAnim,
+    transform: [
+      {
+        translateY: firstAnim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [44, 0],
+        }),
+      },
+      {
+        scale: firstAnim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0.94, 1],
+        }),
+      },
+    ],
+  };
+
+  const secondAnimatedStyle = {
+    opacity: secondAnim,
+    transform: [
+      {
+        translateY: secondAnim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [34, 0],
+        }),
+      },
+      {
+        scale: secondAnim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0.95, 1],
+        }),
+      },
+    ],
+  };
+
+  const thirdAnimatedStyle = {
+    opacity: thirdAnim,
+    transform: [
+      {
+        translateY: thirdAnim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [34, 0],
+        }),
+      },
+      {
+        scale: thirdAnim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0.95, 1],
+        }),
+      },
+    ],
+  };
+
+  const rankColor = (rank) =>
+    rank === 1 ? C.gold : rank === 2 ? C.silver : rank === 3 ? C.bronze : C.primary;
 
   const openStudentProfile = async (item) => {
     setProfileModalVisible(true);
@@ -235,16 +403,8 @@ export default function LeaderboardScreen() {
 
     const { student, schoolInfo } = await resolveStudentAndSchoolDetails(item.userId, item.schoolCode);
 
-    const gender =
-      student?.basicStudentInformation?.gender ||
-      student?.gender ||
-      "";
-
-    const dob =
-      student?.basicStudentInformation?.dob ||
-      student?.dob ||
-      "";
-
+    const gender = student?.basicStudentInformation?.gender || student?.gender || "";
+    const dob = student?.basicStudentInformation?.dob || student?.dob || "";
     const age = yearsFromDob(dob);
 
     const city =
@@ -274,42 +434,13 @@ export default function LeaderboardScreen() {
     setProfileLoading(false);
   };
 
-  const PodiumItem = ({ item, place }) => {
-    if (!item) return <View style={[styles.podiumCol, place === 1 ? styles.podiumCenter : null]} />;
-
-    const isFirst = place === 1;
-    const medalColor = rankColor(place);
-
-    return (
-      <View style={[styles.podiumCol, isFirst ? styles.podiumCenter : null]}>
-        <View style={[styles.podiumAvatarWrap, isFirst ? styles.podiumAvatarWrapFirst : null, { borderColor: medalColor }]}>
-          {item.avatar ? (
-            <Image source={{ uri: item.avatar }} style={styles.podiumAvatar} />
-          ) : (
-            <View style={styles.podiumAvatarFallback}>
-              <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
-            </View>
-          )}
-          <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
-            <Text style={styles.medalText}>{place}</Text>
-          </View>
-        </View>
-
-        <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
-        <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
-
-        <View style={[styles.podiumBlock, isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide, { backgroundColor: `${medalColor}33` }]}>
-          <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
-        </View>
-      </View>
-    );
-  };
-
   if (loading) {
     return (
       <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
         <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
-        <View style={styles.center}><ActivityIndicator color={C.primary} /></View>
+        <View style={styles.center}>
+          <ActivityIndicator color={C.primary} />
+        </View>
       </SafeAreaView>
     );
   }
@@ -325,17 +456,31 @@ export default function LeaderboardScreen() {
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>Leaderboard</Text>
           <Text style={styles.sub}>
-            {scope === "country" ? `${country} • Grade ${grade}` : `${schoolCode || "My School"} • Grade ${grade}`}
+            {scope === "country"
+              ? `${country} • Grade ${grade}`
+              : `${schoolCode || "My School"} • Grade ${grade}`}
           </Text>
         </View>
       </View>
 
       <View style={styles.toggleWrap}>
-        <TouchableOpacity onPress={() => setScope("country")} style={[styles.toggleBtn, scope === "country" ? styles.toggleOn : styles.toggleOff]}>
-          <Text style={scope === "country" ? styles.toggleTextOn : styles.toggleTextOff}>Country</Text>
+        <TouchableOpacity
+          onPress={() => setScope("country")}
+          style={[styles.toggleBtn, scope === "country" ? styles.toggleOn : styles.toggleOff]}
+        >
+          <Text style={scope === "country" ? styles.toggleTextOn : styles.toggleTextOff}>
+            Country
+          </Text>
         </TouchableOpacity>
-        <TouchableOpacity onPress={() => setScope("school")} style={[styles.toggleBtn, scope === "school" ? styles.toggleOn : styles.toggleOff]} disabled={!schoolCode}>
-          <Text style={scope === "school" ? styles.toggleTextOn : styles.toggleTextOff}>School</Text>
+
+        <TouchableOpacity
+          onPress={() => setScope("school")}
+          style={[styles.toggleBtn, scope === "school" ? styles.toggleOn : styles.toggleOff]}
+          disabled={!schoolCode}
+        >
+          <Text style={scope === "school" ? styles.toggleTextOn : styles.toggleTextOff}>
+            School
+          </Text>
         </TouchableOpacity>
       </View>
 
@@ -358,11 +503,11 @@ export default function LeaderboardScreen() {
         </View>
       ) : null}
 
-      {(podium.first || podium.second || podium.third) ? (
+      {hasPodium ? (
         <View style={styles.podiumWrap}>
-          <PodiumItem item={podium.second} place={2} />
-          <PodiumItem item={podium.first} place={1} />
-          <PodiumItem item={podium.third} place={3} />
+          <PodiumItem item={podium.second} place={2} rankColor={rankColor} animatedStyle={secondAnimatedStyle} />
+          <PodiumItem item={podium.first} place={1} rankColor={rankColor} animatedStyle={firstAnimatedStyle} />
+          <PodiumItem item={podium.third} place={3} rankColor={rankColor} animatedStyle={thirdAnimatedStyle} />
         </View>
       ) : null}
 
@@ -384,7 +529,9 @@ export default function LeaderboardScreen() {
               {item.avatar ? (
                 <Image source={{ uri: item.avatar }} style={styles.avatar} />
               ) : (
-                <View style={styles.avatarFallback}><Text style={styles.initial}>{(item.name || "U")[0]}</Text></View>
+                <View style={styles.avatarFallback}>
+                  <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+                </View>
               )}
               <View style={{ flex: 1, marginLeft: 10 }}>
                 <Text numberOfLines={1} style={styles.name}>{item.name}</Text>
@@ -396,14 +543,19 @@ export default function LeaderboardScreen() {
         )}
       />
 
-      <Modal visible={profileModalVisible} transparent animationType="fade" onRequestClose={() => setProfileModalVisible(false)}>
+      <Modal
+        visible={profileModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setProfileModalVisible(false)}
+      >
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             {profileLoading ? (
               <ActivityIndicator color={C.primary} />
             ) : (
               <>
-                <View style={{ alignItems: "center" }}>
+                <View style={styles.profileHero}>
                   {selectedProfile?.avatar ? (
                     <Image source={{ uri: selectedProfile.avatar }} style={styles.modalAvatar} />
                   ) : (
@@ -411,8 +563,11 @@ export default function LeaderboardScreen() {
                       <Text style={styles.initial}>{(selectedProfile?.name || "U")[0]}</Text>
                     </View>
                   )}
+
                   <Text style={styles.modalName}>{selectedProfile?.name || "-"}</Text>
-                  <Text style={styles.modalRank}>#{selectedProfile?.rank || "-"} • {selectedProfile?.points || 0} pts</Text>
+                  <View style={styles.modalRankBadge}>
+                    <Text style={styles.modalRank}>#{selectedProfile?.rank || "-"} • {selectedProfile?.points || 0} pts</Text>
+                  </View>
                 </View>
 
                 <View style={styles.infoGrid}>
@@ -449,10 +604,21 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
-  header: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: 10, paddingBottom: 8 },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 8,
+  },
   backBtn: {
-    width: 36, height: 36, borderRadius: 10, marginRight: 10,
-    alignItems: "center", justifyContent: "center", backgroundColor: "#F7F9FF",
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    marginRight: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F7F9FF",
   },
   title: { fontSize: 22, fontWeight: "900", color: C.text },
   sub: { color: C.muted, marginTop: 2 },
@@ -465,17 +631,31 @@ const styles = StyleSheet.create({
   toggleTextOff: { color: C.text, fontWeight: "800" },
 
   searchWrap: {
-    marginHorizontal: 16, marginTop: 10,
-    flexDirection: "row", alignItems: "center",
-    borderWidth: 1, borderColor: C.border, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 8,
+    marginHorizontal: 16,
+    marginTop: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     backgroundColor: "#fff",
   },
   searchInput: { marginLeft: 8, flex: 1, color: C.text, fontWeight: "600" },
 
   meCard: {
-    marginHorizontal: 16, marginTop: 10, marginBottom: 8,
-    borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, backgroundColor: "#F8FAFF",
-    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    marginHorizontal: 16,
+    marginTop: 10,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 14,
+    padding: 12,
+    backgroundColor: "#F8FAFF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
   meText: { color: C.muted, fontWeight: "700" },
   meRank: { color: C.primary, fontWeight: "900", fontSize: 20 },
@@ -493,23 +673,47 @@ const styles = StyleSheet.create({
   podiumCenter: { marginHorizontal: 4 },
 
   podiumAvatarWrap: {
-    width: 66, height: 66, borderRadius: 33, borderWidth: 2.5,
-    alignItems: "center", justifyContent: "center", backgroundColor: "#fff",
+    width: 66,
+    height: 66,
+    borderRadius: 33,
+    borderWidth: 2.5,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#fff",
   },
   podiumAvatarWrapFirst: { width: 78, height: 78, borderRadius: 39 },
   podiumAvatar: { width: "100%", height: "100%", borderRadius: 999 },
-  podiumAvatarFallback: { width: "100%", height: "100%", borderRadius: 999, backgroundColor: C.primary, alignItems: "center", justifyContent: "center" },
+  podiumAvatarFallback: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 
   medalBadge: {
     position: "absolute",
-    bottom: -6, right: -6,
-    width: 24, height: 24, borderRadius: 12,
-    borderWidth: 1.5, borderColor: "#fff",
-    alignItems: "center", justifyContent: "center",
+    bottom: -6,
+    right: -6,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
   },
   medalText: { color: "#fff", fontWeight: "900", fontSize: 12 },
 
-  podiumName: { marginTop: 8, fontWeight: "800", color: C.text, fontSize: 12, width: 90, textAlign: "center" },
+  podiumName: {
+    marginTop: 8,
+    fontWeight: "800",
+    color: C.text,
+    fontSize: 12,
+    width: 90,
+    textAlign: "center",
+  },
   podiumPts: { marginTop: 2, color: C.muted, fontSize: 11, fontWeight: "700" },
 
   podiumBlock: {
@@ -525,13 +729,26 @@ const styles = StyleSheet.create({
   podiumBlockText: { fontWeight: "900", fontSize: 18 },
 
   row: {
-    borderWidth: 1, borderColor: C.border, borderRadius: 14, backgroundColor: "#fff",
-    paddingHorizontal: 12, paddingVertical: 10, flexDirection: "row", alignItems: "center",
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 14,
+    backgroundColor: "#fff",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
   },
   myRow: { backgroundColor: "#F1F7FF", borderColor: "#CFE1FF" },
   rank: { width: 44, fontWeight: "900", fontSize: 16 },
   avatar: { width: 42, height: 42, borderRadius: 21 },
-  avatarFallback: { width: 42, height: 42, borderRadius: 21, backgroundColor: C.primary, alignItems: "center", justifyContent: "center" },
+  avatarFallback: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   initial: { color: "#fff", fontWeight: "900" },
   name: { color: C.text, fontWeight: "800", fontSize: 14 },
   points: { color: C.muted, marginTop: 2, fontSize: 12 },
@@ -550,20 +767,57 @@ const styles = StyleSheet.create({
     width: "100%",
     maxWidth: 420,
     backgroundColor: "#fff",
-    borderRadius: 16,
-    padding: 16,
+    borderRadius: 22,
+    padding: 18,
   },
-  modalAvatar: { width: 72, height: 72, borderRadius: 36 },
-  modalName: { marginTop: 10, fontWeight: "900", color: C.text, fontSize: 18 },
-  modalRank: { marginTop: 4, color: C.primary, fontWeight: "800" },
+  profileHero: {
+    alignItems: "center",
+    paddingBottom: 6,
+  },
+  modalAvatar: { width: 78, height: 78, borderRadius: 39 },
+  modalName: {
+    marginTop: 12,
+    fontWeight: "900",
+    color: C.text,
+    fontSize: 19,
+  },
+  modalRankBadge: {
+    marginTop: 8,
+    backgroundColor: "#EEF4FF",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  modalRank: { color: C.primary, fontWeight: "800" },
 
-  infoGrid: { marginTop: 14, gap: 8 },
+
+  emptyPodiumAvatarWrap: {
+  backgroundColor: "#F8FAFF",
+  borderStyle: "dashed",
+},
+
+podiumNameEmpty: {
+  marginTop: 8,
+  fontWeight: "800",
+  color: C.muted,
+  fontSize: 12,
+  width: 90,
+  textAlign: "center",
+},
+
+podiumPtsEmpty: {
+  marginTop: 2,
+  color: "#98A2B3",
+  fontSize: 11,
+  fontWeight: "700",
+},
+  infoGrid: { marginTop: 16, gap: 8 },
   infoRow: {
     borderWidth: 1,
     borderColor: C.border,
-    borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     flexDirection: "row",
     justifyContent: "space-between",
   },
@@ -571,11 +825,11 @@ const styles = StyleSheet.create({
   infoValue: { color: C.text, fontWeight: "800", maxWidth: "60%", textAlign: "right" },
 
   closeBtn: {
-    marginTop: 14,
+    marginTop: 16,
     backgroundColor: C.primary,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: "center",
-    paddingVertical: 10,
+    paddingVertical: 12,
   },
   closeBtnText: { color: "#fff", fontWeight: "900" },
 });

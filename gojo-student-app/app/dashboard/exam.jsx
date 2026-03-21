@@ -28,10 +28,23 @@ const BRONZE = "#D08A3A";
 const BG = "#FFFFFF";
 const TEXT = "#0B2540";
 const MUTED = "#6B78A8";
+const BORDER = "#EAF0FF";
 
-const CARD_W = Math.round(SCREEN_W * 0.72);
+const CARD_W = Math.round(SCREEN_W * 0.78);
 const STORY_AVATAR_SIZE = 64;
-const SUBJECT_CARD_W = Math.round(SCREEN_W * 0.44);
+const SUBJECT_CARD_W = Math.round(SCREEN_W * 0.46);
+
+const SUBJECT_ICON_MAP = [
+  { keys: ["english", "literature"], icon: "book-open-page-variant", color: "#6C5CE7" },
+  { keys: ["math", "mathematics", "algebra", "geometry", "maths"], icon: "calculator-variant", color: "#00A8FF" },
+  { keys: ["science", "general science", "biology", "chemistry", "physics"], icon: "flask", color: "#00B894" },
+  { keys: ["environmental", "env"], icon: "leaf", color: "#00C897" },
+  { keys: ["history", "social"], icon: "history", color: "#F39C12" },
+  { keys: ["geography"], icon: "map", color: "#0984e3" },
+  { keys: ["computer", "ict", "computing"], icon: "laptop", color: "#8e44ad" },
+  { keys: ["physical", "pe", "sport"], icon: "run", color: "#e17055" },
+  { keys: ["art"], icon: "palette", color: "#FF7675" },
+];
 
 function normalizeGrade(g) {
   if (!g) return null;
@@ -41,23 +54,40 @@ function normalizeGrade(g) {
   return s.replace(/^grade\s*/i, "");
 }
 
+function normalizeSection(v) {
+  return String(v || "").trim().toUpperCase() || null;
+}
+
+function getSubjectVisual(subjectName = "") {
+  const lower = String(subjectName).toLowerCase();
+  const match = SUBJECT_ICON_MAP.find((item) =>
+    item.keys.some((key) => lower.includes(key))
+  );
+  return (
+    match || {
+      icon: "book-education-outline",
+      color: PRIMARY,
+    }
+  );
+}
+
 async function resolveSchoolKeyFast(studentId) {
   if (!studentId) return null;
 
-  // 1) cached
   try {
     const cached = await AsyncStorage.getItem("schoolKey");
     if (cached) return cached;
   } catch {}
 
-  // 2) fallback scan
   try {
     const schoolsSnap = await getSnapshot([`Platform1/Schools`]);
     const schools = schoolsSnap?.val ? schoolsSnap.val() || {} : {};
     for (const schoolKey of Object.keys(schools)) {
       const sSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
       if (sSnap?.exists()) {
-        try { await AsyncStorage.setItem("schoolKey", schoolKey); } catch {}
+        try {
+          await AsyncStorage.setItem("schoolKey", schoolKey);
+        } catch {}
         return schoolKey;
       }
     }
@@ -163,7 +193,9 @@ export default function ExamScreen() {
 
       raw.sort((a, b) => (a.rank || 999) - (b.rank || 999));
       const top = raw.slice(0, 5);
-      const enriched = await Promise.all(top.map(async (e) => ({ ...e, profile: (await resolveUserProfile(e.userId)).profile || null })));
+      const enriched = await Promise.all(
+        top.map(async (e) => ({ ...e, profile: (await resolveUserProfile(e.userId)).profile || null }))
+      );
       setLeaders(enriched);
     } catch {
       setLeaders([]);
@@ -180,13 +212,18 @@ export default function ExamScreen() {
         const v = pkgVal[key] || {};
         const pkgGrade = normalizeGrade(v.grade);
         if (grade && pkgGrade && pkgGrade !== String(grade)) return;
+
         arr.push({
           id: key,
           name: v.name || key,
           subtitle:
-            v.type === "competitive" ? "National Challenge" :
-            v.type === "practice" ? "Practice Pack" :
-            v.type === "entrance" ? "Entrance Prep" : "Special Pack",
+            v.type === "competitive"
+              ? "National Challenge"
+              : v.type === "practice"
+              ? "Practice Pack"
+              : v.type === "entrance"
+              ? "Entrance Prep"
+              : "Special Pack",
           description: v.description || "Explore package",
           type: v.type || "practice",
           packageIcon: v.packageIcon || "",
@@ -202,153 +239,122 @@ export default function ExamScreen() {
   }, []);
 
   const loadSubjectsFast = useCallback(async ({ studentId, schoolKey }) => {
-  try {
-    if (!studentId) return setSubjects([]);
+    try {
+      if (!studentId || !schoolKey) return setSubjects([]);
 
-    // 0) Resolve student's current grade + section (source of truth)
-    let studentGrade = null;
-    let studentSection = null;
+      let studentGradeValue = null;
+      let studentSection = null;
 
-    // try scoped student first
-    if (schoolKey) {
-      const ss = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
-      if (ss.exists()) {
-        const sv = ss.val() || {};
-        studentGrade =
+      const studentSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
+      if (studentSnap.exists()) {
+        const sv = studentSnap.val() || {};
+        studentGradeValue =
           normalizeGrade(
             sv?.basicStudentInformation?.grade ??
             sv?.grade ??
             null
           ) || null;
+
         studentSection =
-          String(
+          normalizeSection(
             sv?.basicStudentInformation?.section ??
             sv?.section ??
             ""
-          ).trim().toUpperCase() || null;
+          ) || null;
       }
-    }
 
-    // fallback global student
-    if (!studentGrade || !studentSection) {
-      const sg = await get(ref(database, `Students/${studentId}`));
-      if (sg.exists()) {
-        const sv = sg.val() || {};
-        if (!studentGrade) {
-          studentGrade =
-            normalizeGrade(
-              sv?.basicStudentInformation?.grade ??
-              sv?.grade ??
-              null
-            ) || null;
-        }
-        if (!studentSection) {
-          studentSection =
-            String(
-              sv?.basicStudentInformation?.section ??
-              sv?.section ??
-              ""
-            ).trim().toUpperCase() || null;
-        }
+      if (!studentGradeValue || !studentSection) {
+        setSubjects([]);
+        return;
       }
-    }
 
-    // 1) StudentCourses scoped->global
-    let studentCoursesMap = {};
-    if (schoolKey) {
-      const s = await get(ref(database, `Platform1/Schools/${schoolKey}/StudentCourses/${studentId}`));
-      if (s.exists()) studentCoursesMap = s.val() || {};
-    }
-    if (!Object.keys(studentCoursesMap).length) {
-      const g = await get(ref(database, `StudentCourses/${studentId}`));
-      if (g.exists()) studentCoursesMap = g.val() || {};
-    }
+      const gradeMgmtSnap = await get(
+        ref(database, `Platform1/Schools/${schoolKey}/GradeManagement/grades/${studentGradeValue}`)
+      );
 
-    const courseIds = Object.keys(studentCoursesMap).filter((k) => !!studentCoursesMap[k]);
-    if (!courseIds.length) return setSubjects([]);
+      if (!gradeMgmtSnap.exists()) {
+        setSubjects([]);
+        return;
+      }
 
-    // 2) fetch courses in parallel
-    const rawCourses = await Promise.all(
-      courseIds.map(async (courseId) => {
-        let c = null;
+      const gradeNode = gradeMgmtSnap.val() || {};
+      const sectionNode = gradeNode?.sections?.[studentSection] || {};
+      const sectionCoursesMap = sectionNode?.courses || {};
+      const courseIds = Object.keys(sectionCoursesMap).filter((k) => !!sectionCoursesMap[k]);
 
-        if (schoolKey) {
-          const s = await get(ref(database, `Platform1/Schools/${schoolKey}/Courses/${courseId}`));
-          if (s.exists()) c = s.val() || {};
+      const teacherAssignments = gradeNode?.sectionSubjectTeachers?.[studentSection] || {};
+      const assignmentByCourseId = {};
+
+      Object.keys(teacherAssignments).forEach((subjectKey) => {
+        const row = teacherAssignments[subjectKey] || {};
+        if (row?.courseId) {
+          assignmentByCourseId[row.courseId] = {
+            subjectKey,
+            ...row,
+          };
         }
-        if (!c) {
-          const g = await get(ref(database, `Courses/${courseId}`));
-          if (g.exists()) c = g.val() || {};
-        }
+      });
 
-        c = c || {};
+      const baseSubjects = courseIds.map((courseId) => {
+        const assignment = assignmentByCourseId[courseId] || {};
         return {
           courseId,
-          name: c.name || c.subject || courseId,
-          subject: c.subject || c.name || "Subject",
-          grade: normalizeGrade(c.grade) || "",
-          section: String(c.section || "").trim().toUpperCase(),
+          subject: assignment.subject || courseId,
+          name: assignment.subject || courseId,
+          grade: studentGradeValue,
+          section: studentSection,
+          teacherId: assignment.teacherId || "",
+          teacherName: assignment.teacherName || "",
         };
-      })
-    );
+      });
 
-    // 3) HARD FILTER by student current grade + section
-    const courses = rawCourses.filter((c) => {
-      const gradeOk = studentGrade ? String(c.grade) === String(studentGrade) : true;
-      const sectionOk = studentSection ? c.section === studentSection : true;
-      return gradeOk && sectionOk;
-    });
+      let assessmentsObj = {};
+      const assessmentsSnap = await get(
+        ref(database, `Platform1/Schools/${schoolKey}/SchoolExams/Assessments`)
+      );
+      if (assessmentsSnap.exists()) assessmentsObj = assessmentsSnap.val() || {};
 
-    if (!courses.length) {
+      const countByCourse = {};
+      Object.keys(assessmentsObj).forEach((aid) => {
+        const item = assessmentsObj[aid] || {};
+        const cid = item.courseId;
+        if (!cid) return;
+        if (item.status === "removed") return;
+        countByCourse[cid] = (countByCourse[cid] || 0) + 1;
+      });
+
+      const out = baseSubjects.map((c) => ({
+        ...c,
+        assessmentCount: countByCourse[c.courseId] || 0,
+      }));
+
+      setSubjects(out);
+    } catch {
       setSubjects([]);
-      return;
     }
-
-    // 4) assessments once (for badge count only)
-    let assessmentsObj = {};
-    if (schoolKey) {
-      const s = await get(ref(database, `Platform1/Schools/${schoolKey}/SchoolExams/Assessments`));
-      if (s.exists()) assessmentsObj = s.val() || {};
-    }
-    if (!Object.keys(assessmentsObj).length) {
-      const g = await get(ref(database, `SchoolExams/Assessments`));
-      if (g.exists()) assessmentsObj = g.val() || {};
-    }
-
-    const countByCourse = {};
-    Object.keys(assessmentsObj).forEach((aid) => {
-      const cid = assessmentsObj[aid]?.courseId;
-      if (!cid) return;
-      countByCourse[cid] = (countByCourse[cid] || 0) + 1;
-    });
-
-    const out = courses.map((c) => ({
-      ...c,
-      assessmentCount: countByCourse[c.courseId] || 0,
-    }));
-
-    setSubjects(out);
-  } catch {
-    setSubjects([]);
-  }
-}, []);
+  }, []);
 
   const topSection = useMemo(() => (
     <View>
-      <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>Exams</Text>
-          <Text style={styles.subtitle}>Compete nationally and improve your skills</Text>
+      <View style={styles.heroBlock}>
+        <View style={styles.heroBadge}>
+          <Ionicons name="sparkles-outline" size={14} color={PRIMARY} />
+          <Text style={styles.heroBadgeText}>Learn • Practice • Compete</Text>
         </View>
-        <TouchableOpacity style={styles.leaderBtn} onPress={() => router.push("../leaderboard")}>
-          <Ionicons name="trophy" size={15} color="#fff" />
-          <Text style={styles.leaderBtnText}>Leaderboard</Text>
+        <Text style={styles.heroTitle}>Push your learning further</Text>
+        <Text style={styles.heroText}>
+          Join challenges, track assessments, and stay sharp with your current subjects.
+        </Text>
+      </View>
+
+      <View style={styles.sectionHeaderRow}>
+        <Text style={styles.sectionTitle}>Top Students</Text>
+        <TouchableOpacity style={styles.sectionActionBtn} onPress={() => router.push("../leaderboard")}>
+          <Ionicons name="podium-outline" size={15} color="#fff" />
+          <Text style={styles.sectionActionBtnText}>Leaderboard</Text>
         </TouchableOpacity>
       </View>
 
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>Top Students</Text>
-      </View>
       <FlatList
         data={leaders}
         horizontal
@@ -387,59 +393,78 @@ export default function ExamScreen() {
 
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Gojo Challenges</Text>
+        <Text style={styles.sectionSubtitle}>Curated challenge packs with cleaner, faster access</Text>
       </View>
-      <FlatList
-        data={packages}
-        horizontal
-        keyExtractor={(p) => p.id}
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 14 }}
-        ItemSeparatorComponent={() => <View style={{ width: 12 }} />}
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            style={styles.packageCard}
-            activeOpacity={0.9}
-            onPress={() =>
-              router.push({
-                pathname: "/packageSubjects",
-                params: {
-                  packageId: item.id,
-                  packageName: item.name,
-                  studentGrade: studentGrade || "",
-                },
-              })
-            }
-          >
-            {item.packageIcon ? (
-              <Image source={{ uri: item.packageIcon }} style={styles.packageIconImage} />
-            ) : (
-              <View style={styles.packageIconFallback}>
-                <MaterialCommunityIcons
-                  name={
-                    item.type === "competitive"
-                      ? "trophy-outline"
-                      : item.type === "practice"
-                      ? "book-open-page-variant-outline"
-                      : "school-outline"
-                  }
-                  size={22}
-                  color={PRIMARY}
-                />
-              </View>
-            )}
-            <View style={{ flex: 1 }}>
-              <Text style={styles.packageTitle}>{item.name}</Text>
-              <Text style={styles.packageSubtitle}>{item.subtitle}</Text>
-              <Text numberOfLines={2} style={styles.packageDesc}>{item.description}</Text>
-              <Text style={styles.packageMeta}>{item.subjectCount || 0} subjects</Text>
-            </View>
-          </TouchableOpacity>
-        )}
-      />
+
+      {packages.length === 0 ? (
+        <View style={styles.emptyAssessments}>
+          <MaterialCommunityIcons name="trophy-outline" size={24} color={MUTED} />
+          <Text style={styles.emptyAssessmentsText}>No challenge packages available right now.</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={packages}
+          horizontal
+          keyExtractor={(p) => p.id}
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 14 }}
+          ItemSeparatorComponent={() => <View style={{ width: 12 }} />}
+          renderItem={({ item }) => {
+            const iconName =
+              item.type === "competitive"
+                ? "trophy-outline"
+                : item.type === "practice"
+                ? "book-open-page-variant-outline"
+                : "school-outline";
+
+            return (
+              <TouchableOpacity
+                style={styles.challengeCard}
+                activeOpacity={0.92}
+                onPress={() =>
+                  router.push({
+                    pathname: "/packageSubjects",
+                    params: {
+                      packageId: item.id,
+                      packageName: item.name,
+                      studentGrade: studentGrade || "",
+                    },
+                  })
+                }
+              >
+                <View style={styles.challengeTop}>
+                  {item.packageIcon ? (
+                    <Image source={{ uri: item.packageIcon }} style={styles.challengeIconImage} />
+                  ) : (
+                    <View style={styles.challengeIconFallback}>
+                      <MaterialCommunityIcons name={iconName} size={24} color={PRIMARY} />
+                    </View>
+                  )}
+
+                  <View style={styles.challengePill}>
+                    <Text style={styles.challengePillText}>{item.subtitle}</Text>
+                  </View>
+                </View>
+
+                <Text numberOfLines={2} style={styles.challengeTitle}>{item.name}</Text>
+                <Text numberOfLines={2} style={styles.challengeDesc}>{item.description}</Text>
+
+                <View style={styles.challengeFooter}>
+                  <View style={styles.challengeMetaBadge}>
+                    <MaterialCommunityIcons name="shape-outline" size={13} color={PRIMARY} />
+                    <Text style={styles.challengeMetaText}>{item.subjectCount || 0} subjects</Text>
+                  </View>
+                  <Ionicons name="arrow-forward" size={16} color={PRIMARY} />
+                </View>
+              </TouchableOpacity>
+            );
+          }}
+        />
+      )}
 
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>School Assessments</Text>
-        <Text style={styles.sectionSubtitle}>Tap to open assessments</Text>
+        <Text style={styles.sectionSubtitle}>Subjects for your current grade and section</Text>
       </View>
 
       {subjects.length === 0 ? (
@@ -455,42 +480,59 @@ export default function ExamScreen() {
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 20 }}
           ItemSeparatorComponent={() => <View style={{ width: 12 }} />}
-          renderItem={({ item }) => (
-            <TouchableOpacity
-              style={styles.subjectOnlyCard}
-              activeOpacity={0.9}
-              onPress={() =>
-                router.push({
-                  pathname: "/subjectAssessments",
-                  params: {
-                    courseId: item.courseId,
-                    subject: item.subject,
-                    grade: item.grade,
-                    section: item.section,
-                  },
-                })
-              }
-            >
-              <View style={styles.subjectOnlyTop}>
-                <View style={styles.subjectIconWrap}>
-                  <MaterialCommunityIcons name="book-open-variant" size={18} color={PRIMARY} />
-                </View>
-                <View style={styles.countBadge}>
-                  <Text style={styles.countBadgeText}>{item.assessmentCount}</Text>
-                </View>
-              </View>
+          renderItem={({ item }) => {
+            const visual = getSubjectVisual(item.subject);
 
-              <Text numberOfLines={1} style={styles.subjectOnlyTitle}>{item.subject}</Text>
-              <Text style={styles.subjectOnlyMeta}>
-                Grade {item.grade || "--"} • Section {item.section || "--"}
-              </Text>
+            return (
+              <TouchableOpacity
+                style={styles.subjectOnlyCard}
+                activeOpacity={0.92}
+                onPress={() =>
+                  router.push({
+                    pathname: "/subjectAssessments",
+                    params: {
+                      courseId: item.courseId,
+                      subject: item.subject,
+                      grade: item.grade,
+                      section: item.section,
+                    },
+                  })
+                }
+              >
+                <View style={styles.subjectOnlyTop}>
+                  <View style={[styles.subjectIconWrap, { backgroundColor: `${visual.color}14` }]}>
+                    <MaterialCommunityIcons name={visual.icon} size={20} color={visual.color} />
+                  </View>
 
-              <View style={styles.subjectFooterRow}>
-                <Text style={styles.subjectCountLabel}>Open</Text>
-                <Ionicons name="chevron-forward" size={14} color={PRIMARY} />
-              </View>
-            </TouchableOpacity>
-          )}
+                  <View style={[
+                    styles.countBadge,
+                    item.assessmentCount > 0 && styles.countBadgeActive
+                  ]}>
+                    <Text style={[
+                      styles.countBadgeText,
+                      item.assessmentCount > 0 && styles.countBadgeTextActive
+                    ]}>
+                      {item.assessmentCount}
+                    </Text>
+                  </View>
+                </View>
+
+                <Text numberOfLines={1} style={styles.subjectOnlyTitle}>{item.subject}</Text>
+                <Text numberOfLines={1} style={styles.subjectOnlyMeta}>
+                  Grade {item.grade || "--"} • Section {item.section || "--"}
+                </Text>
+
+                <View style={styles.subjectFooterRow}>
+                  <Text style={styles.subjectCountLabel}>
+                    {item.assessmentCount > 0
+                      ? `${item.assessmentCount} assessment${item.assessmentCount === 1 ? "" : "s"}`
+                      : "No assessments yet"}
+                  </Text>
+                  <Ionicons name="chevron-forward" size={14} color={PRIMARY} />
+                </View>
+              </TouchableOpacity>
+            );
+          }}
         />
       )}
     </View>
@@ -520,17 +562,57 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: BG },
   center: { alignItems: "center", justifyContent: "center" },
 
-  header: {
+  heroBlock: {
+    marginHorizontal: 16,
+    marginTop: 14,
+    marginBottom: 6,
+    padding: 16,
+    borderRadius: 20,
+    backgroundColor: "#F7FAFF",
+    borderWidth: 1,
+    borderColor: "#E7F0FF",
+  },
+  heroBadge: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF4FF",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  heroBadgeText: {
+    marginLeft: 6,
+    color: PRIMARY,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  heroTitle: {
+    marginTop: 12,
+    fontSize: 22,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  heroText: {
+    marginTop: 6,
+    color: MUTED,
+    lineHeight: 20,
+    fontSize: 13,
+  },
+
+  sectionHeader: { paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
+  sectionHeaderRow: {
     paddingHorizontal: 16,
     paddingTop: 14,
     paddingBottom: 8,
     flexDirection: "row",
-    justifyContent: "space-between",
     alignItems: "center",
+    justifyContent: "space-between",
   },
-  title: { fontSize: 24, fontWeight: "900", color: TEXT },
-  subtitle: { marginTop: 4, color: MUTED, fontSize: 13 },
-  leaderBtn: {
+  sectionTitle: { fontSize: 18, fontWeight: "900", color: TEXT },
+  sectionSubtitle: { marginTop: 2, fontSize: 12, color: MUTED },
+
+  sectionActionBtn: {
     flexDirection: "row",
     alignItems: "center",
     backgroundColor: PRIMARY,
@@ -538,11 +620,12 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 12,
   },
-  leaderBtnText: { color: "#fff", marginLeft: 6, fontWeight: "800", fontSize: 12 },
-
-  sectionHeader: { paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
-  sectionTitle: { fontSize: 18, fontWeight: "900", color: TEXT },
-  sectionSubtitle: { marginTop: 2, fontSize: 12, color: MUTED },
+  sectionActionBtnText: {
+    color: "#fff",
+    marginLeft: 6,
+    fontWeight: "800",
+    fontSize: 12,
+  },
 
   storyWrap: { width: STORY_AVATAR_SIZE + 16, alignItems: "center" },
   avatarShadow: {
@@ -580,40 +663,90 @@ const styles = StyleSheet.create({
   rank: { marginTop: 6, color: PRIMARY, fontWeight: "900", fontSize: 12 },
   storyName: { marginTop: 2, width: STORY_AVATAR_SIZE + 8, textAlign: "center", fontSize: 11, color: TEXT },
 
-  packageCard: {
+  challengeCard: {
     width: CARD_W,
     backgroundColor: "#fff",
-    borderRadius: 16,
+    borderRadius: 20,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    padding: 12,
-    flexDirection: "row",
-    alignItems: "center",
+    borderColor: BORDER,
+    padding: 14,
     shadowColor: "#000",
-    shadowOpacity: 0.04,
-    shadowRadius: 8,
-    elevation: 2,
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    elevation: 3,
   },
-  packageIconImage: { width: 56, height: 56, borderRadius: 12, marginRight: 10, backgroundColor: "#F1F5FF" },
-  packageIconFallback: {
-    width: 56,
-    height: 56,
-    borderRadius: 12,
-    marginRight: 10,
+  challengeTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  challengeIconImage: {
+    width: 58,
+    height: 58,
+    borderRadius: 14,
+    backgroundColor: "#F1F5FF",
+  },
+  challengeIconFallback: {
+    width: 58,
+    height: 58,
+    borderRadius: 14,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "#EEF4FF",
   },
-  packageTitle: { fontSize: 16, fontWeight: "900", color: TEXT },
-  packageSubtitle: { marginTop: 2, fontSize: 12, color: PRIMARY, fontWeight: "700" },
-  packageDesc: { marginTop: 4, color: MUTED, lineHeight: 17, fontSize: 12 },
-  packageMeta: { marginTop: 6, color: TEXT, fontWeight: "800", fontSize: 12 },
+  challengePill: {
+    backgroundColor: "#F7FAFF",
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    marginLeft: 10,
+    flexShrink: 1,
+  },
+  challengePillText: {
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  challengeTitle: {
+    marginTop: 14,
+    fontSize: 17,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  challengeDesc: {
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 18,
+    color: MUTED,
+  },
+  challengeFooter: {
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  challengeMetaBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF4FF",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+  },
+  challengeMetaText: {
+    marginLeft: 6,
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "800",
+  },
 
   emptyAssessments: {
     marginHorizontal: 16,
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
+    borderColor: BORDER,
     backgroundColor: "#F9FBFF",
     borderRadius: 14,
     padding: 14,
@@ -626,44 +759,47 @@ const styles = StyleSheet.create({
   subjectOnlyCard: {
     width: SUBJECT_CARD_W,
     backgroundColor: "#fff",
-    borderRadius: 16,
+    borderRadius: 18,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    padding: 12,
+    borderColor: BORDER,
+    padding: 14,
     shadowColor: "#000",
     shadowOpacity: 0.04,
-    shadowRadius: 6,
+    shadowRadius: 8,
     elevation: 2,
   },
   subjectOnlyTop: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: 10,
+    marginBottom: 12,
   },
   subjectIconWrap: {
-    width: 32,
-    height: 32,
-    borderRadius: 10,
-    backgroundColor: "#EEF4FF",
+    width: 38,
+    height: 38,
+    borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
   },
   countBadge: {
-    backgroundColor: "#EEF4FF",
+    backgroundColor: "#F4F6FA",
     borderRadius: 12,
-    minWidth: 24,
-    height: 24,
+    minWidth: 28,
+    height: 28,
     alignItems: "center",
     justifyContent: "center",
-    paddingHorizontal: 6,
+    paddingHorizontal: 7,
   },
-  countBadgeText: { color: PRIMARY, fontSize: 11, fontWeight: "800" },
+  countBadgeActive: {
+    backgroundColor: "#EEF4FF",
+  },
+  countBadgeText: { color: MUTED, fontSize: 11, fontWeight: "800" },
+  countBadgeTextActive: { color: PRIMARY },
 
-  subjectOnlyTitle: { fontSize: 14, fontWeight: "900", color: TEXT },
-  subjectOnlyMeta: { marginTop: 2, fontSize: 11, color: MUTED, fontWeight: "600" },
+  subjectOnlyTitle: { fontSize: 15, fontWeight: "900", color: TEXT },
+  subjectOnlyMeta: { marginTop: 4, fontSize: 11, color: MUTED, fontWeight: "600" },
   subjectFooterRow: {
-    marginTop: 12,
+    marginTop: 14,
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
