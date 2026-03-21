@@ -11,7 +11,7 @@ import {
   Alert,
   Image,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -23,6 +23,12 @@ import { database, storage } from "../constants/firebaseConfig";
 
 const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
+const TEXT = "#0B2540";
+const BORDER = "#EAF0FF";
+const BG = "#FFFFFF";
+const SUCCESS = "#12B76A";
+const WARNING = "#F59E0B";
+const DANGER = "#EF4444";
 
 export default function TakeAssessment() {
   const router = useRouter();
@@ -96,12 +102,14 @@ export default function TakeAssessment() {
 
   useEffect(() => {
     if (!assessment?.dueDate) return;
-    const dueTs = Number(assessment.dueDate);
-    if (Number.isNaN(dueTs) || dueTs <= 0) return; // <=0 means no timer
+
+    const dueTs = normalizeUnixTimestamp(assessment.dueDate);
+    if (!dueTs || dueTs <= 0) return;
 
     const tick = () => {
       const left = dueTs - Date.now();
       setTimeLeftMs(left);
+
       if (left <= 0 && !autoSubmittedRef.current && !submitting && !alreadySubmitted) {
         autoSubmittedRef.current = true;
         submitAssessment(true);
@@ -135,6 +143,11 @@ export default function TakeAssessment() {
     setAnswers((p) => ({ ...p, [qid]: { type: "mcq", value: option } }));
   };
 
+  const setTrueFalse = (qid, option) => {
+    if (readOnly) return;
+    setAnswers((p) => ({ ...p, [qid]: { type: "true_false", value: option } }));
+  };
+
   const setFillBlank = (qid, text) => {
     if (readOnly) return;
     setAnswers((p) => ({ ...p, [qid]: { type: "fill_blank", value: text } }));
@@ -143,7 +156,12 @@ export default function TakeAssessment() {
   const setWrittenText = (qid, text) => {
     if (readOnly) return;
     const prev = answers[qid] || { type: "written", textAnswer: "", imageUrls: {} };
-    setAnswers((p) => ({ ...p, [qid]: { ...prev, type: "written", textAnswer: text } }));
+    if (Object.keys(prev.imageUrls || {}).length > 0) return;
+
+    setAnswers((p) => ({
+      ...p,
+      [qid]: { ...prev, type: "written", textAnswer: text },
+    }));
   };
 
   const addWrittenImage = async (qid) => {
@@ -178,7 +196,12 @@ export default function TakeAssessment() {
 
       setAnswers((p) => ({
         ...p,
-        [qid]: { ...prev, type: "written", imageUrls: nextImageUrls },
+        [qid]: {
+          ...prev,
+          type: "written",
+          textAnswer: "",
+          imageUrls: nextImageUrls,
+        },
       }));
     } catch {
       Alert.alert("Upload failed", "Could not upload image.");
@@ -191,7 +214,10 @@ export default function TakeAssessment() {
     if (!prev?.imageUrls) return;
     const next = { ...prev.imageUrls };
     delete next[imageKey];
-    setAnswers((p) => ({ ...p, [qid]: { ...prev, imageUrls: next } }));
+    setAnswers((p) => ({
+      ...p,
+      [qid]: { ...prev, imageUrls: next },
+    }));
   };
 
   const submitAssessment = async (isAuto = false) => {
@@ -216,6 +242,14 @@ export default function TakeAssessment() {
         if (q.type === "mcq") {
           packedAnswers[q.id] = { type: "mcq", value: a.value || "" };
           if ((a.value || "") === (q.correctAnswer || "")) autoScore += Number(q.points || 0);
+        } else if (q.type === "true_false") {
+          packedAnswers[q.id] = { type: "true_false", value: a.value || "" };
+          if (
+            String(a.value || "").trim().toLowerCase() ===
+            String(q.correctAnswer || "").trim().toLowerCase()
+          ) {
+            autoScore += Number(q.points || 0);
+          }
         } else if (q.type === "fill_blank") {
           const studentValue = String(a.value || "").trim().toLowerCase();
           const correct = String(q.correctAnswer || "").trim().toLowerCase();
@@ -268,21 +302,22 @@ export default function TakeAssessment() {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
-        <ActivityIndicator />
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top, backgroundColor: BG }]}>
+        <ActivityIndicator size="large" color={PRIMARY} />
       </SafeAreaView>
     );
   }
 
   if (!assessment) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
-        <Text>Assessment not found.</Text>
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top, backgroundColor: BG }]}>
+        <Text style={{ color: TEXT, fontWeight: "700" }}>Assessment not found.</Text>
       </SafeAreaView>
     );
   }
 
   const timerText = formatTimeLeft(timeLeftMs);
+  const dueLabel = formatDueDate(assessment?.dueDate);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -292,6 +327,7 @@ export default function TakeAssessment() {
           paddingHorizontal: 14,
           paddingBottom: Math.max(28, insets.bottom + 20),
         }}
+        showsVerticalScrollIndicator={false}
       >
         <View style={styles.topNav}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backIconBtn}>
@@ -299,90 +335,155 @@ export default function TakeAssessment() {
           </TouchableOpacity>
         </View>
 
-        <Text style={styles.title}>{assessment.title || "Assessment"}</Text>
-        <Text style={styles.meta}>Total: {assessment.totalPoints || totalPoints} pts</Text>
-        {Number(assessment?.dueDate || 0) > 0 ? (
-          <Text style={[styles.meta, { color: timeLeftMs <= 0 ? "#EF4444" : MUTED }]}>
-            Time left: {timerText}
-          </Text>
-        ) : (
-          <Text style={styles.meta}>No time limit</Text>
-        )}
+        <View style={styles.heroCard}>
+          <Text style={styles.title}>{assessment.title || "Assessment"}</Text>
+          <Text style={styles.metaLine}>Total: {assessment.totalPoints || totalPoints} pts</Text>
+          <Text style={styles.metaLine}>Due: {dueLabel}</Text>
+
+          {Number(assessment?.dueDate || 0) > 0 ? (
+            <View style={styles.timerPill}>
+              <Ionicons
+                name="time-outline"
+                size={14}
+                color={timeLeftMs <= 0 ? DANGER : PRIMARY}
+              />
+              <Text
+                style={[
+                  styles.timerText,
+                  { color: timeLeftMs <= 0 ? DANGER : PRIMARY },
+                ]}
+              >
+                {timerText}
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.timerPillMuted}>
+              <Ionicons name="time-outline" size={14} color={MUTED} />
+              <Text style={styles.timerMutedText}>No time limit</Text>
+            </View>
+          )}
+        </View>
 
         {alreadySubmitted && (
           <View style={styles.infoBox}>
+            <Ionicons name="checkmark-circle" size={16} color={PRIMARY} />
             <Text style={styles.infoText}>Already submitted. You cannot submit again.</Text>
           </View>
         )}
 
-        {questions.map((q, idx) => (
-          <View key={q.id} style={styles.card}>
-            <Text style={styles.qTitle}>{idx + 1}. {q.question}</Text>
-            <Text style={styles.qMeta}>{q.type} • {q.points || 0} pts</Text>
+        {questions.map((q, idx) => {
+          const writtenHasImage = Object.keys(answers[q.id]?.imageUrls || {}).length > 0;
 
-            {q.type === "mcq" && (
-              <View style={{ marginTop: 8 }}>
-                {Object.keys(q.options || {}).map((k) => {
-                  const selected = answers[q.id]?.value === k;
-                  return (
-                    <TouchableOpacity
-                      key={k}
-                      style={[styles.opt, selected && styles.optSelected, readOnly && { opacity: 0.7 }]}
-                      onPress={() => setMcq(q.id, k)}
-                      disabled={readOnly}
-                    >
-                      <Text>{k}. {q.options[k]}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
+          return (
+            <View key={q.id} style={styles.card}>
+              <View style={styles.qHeader}>
+                <Text style={styles.qNumber}>Q{idx + 1}</Text>
+                <Text style={styles.qPoints}>{q.points || 0} pts</Text>
               </View>
-            )}
 
-            {q.type === "fill_blank" && (
-              <TextInput
-                placeholder="Type your answer"
-                style={styles.input}
-                value={answers[q.id]?.value || ""}
-                onChangeText={(t) => setFillBlank(q.id, t)}
-                editable={!readOnly}
-              />
-            )}
+              <Text style={styles.qTitle}>{q.question}</Text>
+              <Text style={styles.qMeta}>{String(q.type || "").replace("_", " ")}</Text>
 
-            {q.type === "written" && (
-              <View style={{ marginTop: 8 }}>
+              {q.type === "mcq" && (
+                <View style={styles.answerBlock}>
+                  {Object.keys(q.options || {}).map((k) => {
+                    const selected = answers[q.id]?.value === k;
+                    return (
+                      <TouchableOpacity
+                        key={k}
+                        style={[styles.opt, selected && styles.optSelected, readOnly && { opacity: 0.7 }]}
+                        onPress={() => setMcq(q.id, k)}
+                        disabled={readOnly}
+                      >
+                        <Text style={styles.optText}>{k}. {q.options[k]}</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
+
+              {q.type === "true_false" && (
+                <View style={styles.answerBlockRow}>
+                  {["True", "False"].map((value) => {
+                    const selected =
+                      String(answers[q.id]?.value || "").toLowerCase() === value.toLowerCase();
+
+                    return (
+                      <TouchableOpacity
+                        key={value}
+                        style={[styles.tfBtn, selected && styles.tfBtnSelected, readOnly && { opacity: 0.7 }]}
+                        onPress={() => setTrueFalse(q.id, value)}
+                        disabled={readOnly}
+                      >
+                        <Text style={[styles.tfText, selected && styles.tfTextSelected]}>{value}</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
+
+              {q.type === "fill_blank" && (
                 <TextInput
-                  multiline
-                  placeholder="Write your answer..."
-                  style={[styles.input, { minHeight: 90 }]}
-                  value={answers[q.id]?.textAnswer || ""}
-                  onChangeText={(t) => setWrittenText(q.id, t)}
+                  placeholder="Type your answer"
+                  placeholderTextColor="#9AA6D1"
+                  style={styles.input}
+                  value={answers[q.id]?.value || ""}
+                  onChangeText={(t) => setFillBlank(q.id, t)}
                   editable={!readOnly}
                 />
+              )}
 
-                <TouchableOpacity
-                  style={[styles.uploadBtn, readOnly && { opacity: 0.6 }]}
-                  onPress={() => addWrittenImage(q.id)}
-                  disabled={readOnly}
-                >
-                  <Text style={styles.uploadText}>+ Add handwritten image</Text>
-                </TouchableOpacity>
+              {q.type === "written" && (
+                <View style={styles.answerBlock}>
+                  <TextInput
+                    multiline
+                    placeholder={
+                      writtenHasImage
+                        ? "Writing disabled because image answer is attached."
+                        : "Write your answer..."
+                    }
+                    placeholderTextColor="#9AA6D1"
+                    style={[styles.input, { minHeight: 100 }, writtenHasImage && styles.inputDisabled]}
+                    value={answers[q.id]?.textAnswer || ""}
+                    onChangeText={(t) => setWrittenText(q.id, t)}
+                    editable={!readOnly && !writtenHasImage}
+                  />
 
-                <View style={styles.imageRow}>
-                  {Object.entries(answers[q.id]?.imageUrls || {}).map(([k, url]) => (
-                    <View key={k} style={styles.imgWrap}>
-                      <Image source={{ uri: url }} style={styles.img} />
-                      {!readOnly && (
-                        <TouchableOpacity style={styles.removeImgBtn} onPress={() => removeWrittenImage(q.id, k)}>
-                          <Text style={{ color: "#fff", fontSize: 11 }}>✕</Text>
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  ))}
+                  <TouchableOpacity
+                    style={[styles.uploadBtn, readOnly && { opacity: 0.6 }]}
+                    onPress={() => addWrittenImage(q.id)}
+                    disabled={readOnly}
+                  >
+                    <MaterialCommunityIcons name="image-plus" size={14} color={PRIMARY} />
+                    <Text style={styles.uploadText}>Add handwritten image</Text>
+                  </TouchableOpacity>
+
+                  {writtenHasImage ? (
+                    <Text style={styles.helperText}>
+                      Image answer attached. Text answer is disabled for this question.
+                    </Text>
+                  ) : null}
+
+                  <View style={styles.imageRow}>
+                    {Object.entries(answers[q.id]?.imageUrls || {}).map(([k, url]) => (
+                      <View key={k} style={styles.imgWrap}>
+                        <Image source={{ uri: url }} style={styles.img} />
+                        {!readOnly && (
+                          <TouchableOpacity
+                            style={styles.removeImgBtn}
+                            onPress={() => removeWrittenImage(q.id, k)}
+                          >
+                            <Text style={styles.removeImgText}>✕</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    ))}
+                  </View>
                 </View>
-              </View>
-            )}
-          </View>
-        ))}
+              )}
+            </View>
+          );
+        })}
 
         <TouchableOpacity
           style={[styles.submitBtn, (readOnly || submitting) && { opacity: 0.65 }]}
@@ -390,7 +491,11 @@ export default function TakeAssessment() {
           disabled={readOnly || submitting}
         >
           <Text style={styles.submitText}>
-            {alreadySubmitted ? "Already Submitted" : submitting ? "Submitting..." : "Submit Assessment"}
+            {alreadySubmitted
+              ? "Already Submitted"
+              : submitting
+              ? "Submitting..."
+              : "Submit Assessment"}
           </Text>
         </TouchableOpacity>
       </ScrollView>
@@ -399,6 +504,25 @@ export default function TakeAssessment() {
 }
 
 /* ---------------- Helpers ---------------- */
+
+function normalizeUnixTimestamp(ts) {
+  const num = Number(ts);
+  if (!num || Number.isNaN(num)) return null;
+  return num < 1000000000000 ? num * 1000 : num;
+}
+
+function formatDueDate(dueDate) {
+  const normalized = normalizeUnixTimestamp(dueDate);
+  if (!normalized) return "No due date";
+  const d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return "No due date";
+
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
 
 async function resolveSchoolKeyFast(studentId) {
   if (!studentId) return null;
@@ -458,12 +582,6 @@ async function loadAssessment(schoolKey, assessmentId) {
   return null;
 }
 
-/**
- * Robust question resolver for changed QuestionBank structures:
- * - direct keyed: QB[qid]
- * - nested arbitrary depth: QB/.../.../qid
- * - avoids per-question full scans by flattening once per root
- */
 async function resolveQuestionsDynamic({ questionRefs, schoolKey }) {
   const ids = Object.values(questionRefs || {});
   if (!ids.length) return [];
@@ -504,7 +622,6 @@ function flattenQuestionBank(root) {
     for (const [key, val] of Object.entries(node)) {
       if (!val || typeof val !== "object") continue;
 
-      // heuristic: a question object must have at least type + question
       const isQuestion =
         typeof val.type === "string" &&
         typeof val.question === "string";
@@ -528,7 +645,9 @@ function formatTimeLeft(ms) {
   const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;
 
-  if (h > 0) return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  if (h > 0) {
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
@@ -549,48 +668,134 @@ async function uriToBlob(uri) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fff" },
+  container: { flex: 1, backgroundColor: BG },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
-  topNav: { marginBottom: 6 },
+  topNav: { marginBottom: 8 },
   backIconBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 10,
+    width: 38,
+    height: 38,
+    borderRadius: 12,
     backgroundColor: "#EEF4FF",
     alignItems: "center",
     justifyContent: "center",
   },
 
-  title: { fontSize: 20, fontWeight: "900", marginBottom: 4 },
-  meta: { color: MUTED, marginBottom: 6, fontWeight: "600" },
+  heroCard: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 22,
+    padding: 16,
+    backgroundColor: "#F8FBFF",
+    marginBottom: 14,
+  },
+  title: { fontSize: 22, fontWeight: "900", color: TEXT, marginBottom: 6 },
+  metaLine: { color: MUTED, marginBottom: 5, fontWeight: "700", fontSize: 12.5 },
+
+  timerPill: {
+    alignSelf: "flex-start",
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF4FF",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+  },
+  timerText: {
+    marginLeft: 6,
+    fontWeight: "900",
+    fontSize: 12,
+  },
+  timerPillMuted: {
+    alignSelf: "flex-start",
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#F7FAFF",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+  },
+  timerMutedText: {
+    marginLeft: 6,
+    color: MUTED,
+    fontWeight: "800",
+    fontSize: 12,
+  },
 
   infoBox: {
     backgroundColor: "#EEF4FF",
     borderWidth: 1,
     borderColor: "#BFDBFE",
-    borderRadius: 10,
-    padding: 10,
-    marginBottom: 10,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+    flexDirection: "row",
+    alignItems: "center",
   },
-  infoText: { color: PRIMARY, fontWeight: "700", fontSize: 12 },
+  infoText: {
+    color: PRIMARY,
+    fontWeight: "700",
+    fontSize: 12,
+    marginLeft: 8,
+    flex: 1,
+  },
 
   card: {
     borderWidth: 1,
-    borderColor: "#e5e7eb",
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 10,
+    borderColor: BORDER,
+    borderRadius: 18,
+    padding: 14,
+    marginBottom: 12,
     backgroundColor: "#fff",
   },
-  qTitle: { fontSize: 15, fontWeight: "700" },
-  qMeta: { marginTop: 2, fontSize: 12, color: MUTED },
+  qHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  qNumber: {
+    backgroundColor: "#EEF4FF",
+    color: PRIMARY,
+    fontWeight: "900",
+    fontSize: 11,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    overflow: "hidden",
+  },
+  qPoints: {
+    color: MUTED,
+    fontWeight: "800",
+    fontSize: 11,
+  },
+  qTitle: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: TEXT,
+    marginTop: 10,
+    lineHeight: 21,
+  },
+  qMeta: {
+    marginTop: 4,
+    fontSize: 11.5,
+    color: MUTED,
+    fontWeight: "700",
+    textTransform: "capitalize",
+  },
+
+  answerBlock: { marginTop: 10 },
+  answerBlockRow: {
+    marginTop: 10,
+    flexDirection: "row",
+  },
 
   opt: {
-    padding: 10,
+    padding: 11,
     borderWidth: 1,
-    borderColor: "#dbeafe",
-    borderRadius: 10,
+    borderColor: "#DCE8FF",
+    borderRadius: 12,
     marginTop: 8,
     backgroundColor: "#fff",
   },
@@ -598,29 +803,91 @@ const styles = StyleSheet.create({
     borderColor: PRIMARY,
     backgroundColor: "#EEF4FF",
   },
+  optText: {
+    color: TEXT,
+    fontWeight: "600",
+    fontSize: 13,
+  },
+
+  tfBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#DCE8FF",
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  tfBtnSelected: {
+    backgroundColor: "#EEF4FF",
+    borderColor: PRIMARY,
+  },
+  tfText: {
+    color: TEXT,
+    fontWeight: "700",
+  },
+  tfTextSelected: {
+    color: PRIMARY,
+  },
 
   input: {
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#e5e7eb",
-    borderRadius: 10,
-    padding: 10,
+    borderColor: "#E5EAF5",
+    borderRadius: 12,
+    padding: 12,
     textAlignVertical: "top",
+    color: TEXT,
+    backgroundColor: "#fff",
+  },
+  inputDisabled: {
+    backgroundColor: "#F8FAFF",
+    color: MUTED,
   },
 
   uploadBtn: {
-    marginTop: 8,
+    marginTop: 10,
     alignSelf: "flex-start",
     backgroundColor: "#EEF4FF",
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 12,
+    flexDirection: "row",
+    alignItems: "center",
   },
-  uploadText: { color: PRIMARY, fontWeight: "700", fontSize: 12 },
+  uploadText: {
+    color: PRIMARY,
+    fontWeight: "700",
+    fontSize: 12,
+    marginLeft: 7,
+  },
+  helperText: {
+    marginTop: 8,
+    color: MUTED,
+    fontSize: 11.5,
+    fontWeight: "600",
+  },
 
-  imageRow: { flexDirection: "row", flexWrap: "wrap", marginTop: 8 },
-  imgWrap: { width: 74, height: 74, marginRight: 8, marginBottom: 8, position: "relative" },
-  img: { width: "100%", height: "100%", borderRadius: 8, backgroundColor: "#f3f4f6" },
+  imageRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 10,
+  },
+  imgWrap: {
+    width: 76,
+    height: 76,
+    marginRight: 8,
+    marginBottom: 8,
+    position: "relative",
+  },
+  img: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 10,
+    backgroundColor: "#F3F4F6",
+  },
   removeImgBtn: {
     position: "absolute",
     top: -6,
@@ -628,17 +895,25 @@ const styles = StyleSheet.create({
     width: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: "#ef4444",
+    backgroundColor: "#EF4444",
     alignItems: "center",
     justifyContent: "center",
   },
+  removeImgText: {
+    color: "#fff",
+    fontSize: 11,
+  },
 
   submitBtn: {
-    marginTop: 16,
+    marginTop: 8,
     backgroundColor: PRIMARY,
-    padding: 14,
-    borderRadius: 12,
+    padding: 15,
+    borderRadius: 14,
     alignItems: "center",
   },
-  submitText: { color: "#fff", fontWeight: "800" },
+  submitText: {
+    color: "#fff",
+    fontWeight: "900",
+    fontSize: 14,
+  },
 });
